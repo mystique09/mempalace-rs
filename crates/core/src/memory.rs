@@ -70,6 +70,17 @@ pub trait MemoryStore: Send + Sync {
     }
     async fn get_drawer(&self, drawer_id: &str) -> Result<Option<Drawer>>;
     async fn delete_drawer(&self, drawer_id: &str) -> Result<bool>;
+    async fn delete_source_file(&self, source_file: &str) -> Result<usize> {
+        let mut deleted = 0usize;
+        for drawer in self.list_drawers(None).await? {
+            if drawer.metadata.source_file.as_deref() == Some(source_file)
+                && self.delete_drawer(&drawer.id).await?
+            {
+                deleted += 1;
+            }
+        }
+        Ok(deleted)
+    }
     async fn list_drawers(&self, wing: Option<&str>) -> Result<Vec<Drawer>>;
     async fn search(&self, query: SearchQuery) -> Result<Vec<SearchHit>>;
     async fn status(&self) -> Result<StoreStatus>;

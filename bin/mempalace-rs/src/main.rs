@@ -67,6 +67,8 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
         #[arg(long)]
+        skip_existing: bool,
+        #[arg(long)]
         include_data_files: bool,
         #[arg(long)]
         no_gitignore: bool,
@@ -223,6 +225,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             agent,
             limit,
             dry_run,
+            skip_existing,
             include_data_files,
             no_gitignore,
         } => {
@@ -235,6 +238,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     agent,
                     limit,
                     dry_run,
+                    skip_existing,
                     include_data_files,
                     respect_gitignore: !no_gitignore,
                     log_progress: true,
@@ -1428,6 +1432,9 @@ async fn run_mine(
     if options.dry_run {
         println!("  DRY RUN: true");
     }
+    if options.skip_existing {
+        println!("  Existing files: SKIP");
+    }
     if options.include_data_files {
         println!("  Data files: INCLUDED");
     }
@@ -1445,6 +1452,7 @@ async fn run_mine(
     println!("  Files scanned: {}", summary.files_scanned);
     println!("  Files processed: {}", summary.files_processed);
     println!("  Files skipped: {}", summary.files_skipped);
+    println!("  Files replaced: {}", summary.files_replaced);
     println!("  Drawers filed: {}", summary.total_drawers);
 
     if !summary.room_counts.is_empty() {

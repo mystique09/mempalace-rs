@@ -118,6 +118,17 @@ impl LanceMemoryStore {
         Ok(batches.iter().any(|batch| batch.num_rows() > 0))
     }
 
+    pub async fn delete_source_file(&self, source_file: &str) -> Result<usize> {
+        let Some(table) = self.open_table().await? else {
+            return Ok(0);
+        };
+
+        let deleted = table
+            .delete(&format!("source_file = '{}'", sql_escape(source_file)))
+            .await?;
+        Ok(deleted.num_deleted_rows as usize)
+    }
+
     pub async fn room_counts(&self) -> Result<Vec<RoomStatus>> {
         let Some(table) = self.open_table().await? else {
             return Ok(Vec::new());
@@ -571,6 +582,10 @@ impl MemoryStore for LanceMemoryStore {
 
         let deleted = table.delete(&Self::filter_clause(drawer_id)).await?;
         Ok(deleted.num_deleted_rows > 0)
+    }
+
+    async fn delete_source_file(&self, source_file: &str) -> Result<usize> {
+        LanceMemoryStore::delete_source_file(self, source_file).await
     }
 
     async fn list_drawers(&self, wing: Option<&str>) -> Result<Vec<Drawer>> {
