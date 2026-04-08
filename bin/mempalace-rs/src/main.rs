@@ -69,7 +69,7 @@ enum Command {
         #[arg(long)]
         skip_existing: bool,
         #[arg(long)]
-        include_data_files: bool,
+        exclude_data_files: bool,
         #[arg(long)]
         no_gitignore: bool,
     },
@@ -226,7 +226,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             limit,
             dry_run,
             skip_existing,
-            include_data_files,
+            exclude_data_files,
             no_gitignore,
         } => {
             let app = open_context(cli.palace).await?;
@@ -239,7 +239,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     limit,
                     dry_run,
                     skip_existing,
-                    include_data_files,
+                    exclude_data_files,
                     respect_gitignore: !no_gitignore,
                     log_progress: true,
                 },
@@ -1435,8 +1435,8 @@ async fn run_mine(
     if options.skip_existing {
         println!("  Existing files: SKIP");
     }
-    if options.include_data_files {
-        println!("  Data files: INCLUDED");
+    if options.exclude_data_files {
+        println!("  Data files: EXCLUDED");
     }
     if !options.respect_gitignore {
         println!("  .gitignore: DISABLED");

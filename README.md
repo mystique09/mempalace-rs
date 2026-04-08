@@ -96,7 +96,7 @@ Useful flags:
 
 - `--palace <PATH>` overrides the configured palace path for any command.
 - `init --no-onboarding` skips the interactive bootstrap flow.
-- `mine --include-data-files` includes noisy `.json`, `.csv`, and `.sql` files that are skipped by default.
+- `mine --exclude-data-files` skips noisy `.json`, `.csv`, and `.sql` files in data-heavy folders when you want a cleaner index than the Python default.
 - `mine --no-gitignore` disables `.gitignore`-aware scanning.
 - `search --all-wings` disables implicit wing narrowing.
 
@@ -136,7 +136,8 @@ The current Rust miner is intentionally simple and predictable:
 
 - It scans common text and source extensions such as `.md`, `.rs`, `.py`, `.ts`, `.json`, `.sql`, and `.toml`.
 - It skips common build and cache directories such as `.git`, `node_modules`, `.venv`, `.next`, `coverage`, and `target`.
-- It skips noisy data files in places like `assets/`, `migrations/`, `fixtures/`, and `seed/` unless `--include-data-files` is set.
+- By default it matches the Python miner and includes readable data files in places like `assets/`, `migrations/`, `fixtures/`, and `seed/`.
+- `mine --exclude-data-files` restores the Rust-only cleaner-index behavior by skipping noisy `.json`, `.csv`, and `.sql` files in those folders.
 - It uses the first path segment under the project root as the drawer room. Root-level files fall back to `general`.
 - It chunks content at roughly 800 characters with 100 characters of overlap and ignores chunks shorter than 50 characters.
 - It deduplicates by `source_file`, so rerunning `mine` on an unchanged project skips files already in the store.

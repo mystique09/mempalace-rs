@@ -72,7 +72,7 @@ pub struct MineOptions {
     pub limit: usize,
     pub dry_run: bool,
     pub skip_existing: bool,
-    pub include_data_files: bool,
+    pub exclude_data_files: bool,
     pub respect_gitignore: bool,
     pub log_progress: bool,
 }
@@ -85,7 +85,7 @@ impl Default for MineOptions {
             limit: 0,
             dry_run: false,
             skip_existing: false,
-            include_data_files: false,
+            exclude_data_files: false,
             respect_gitignore: true,
             log_progress: false,
         }
@@ -152,7 +152,7 @@ pub async fn mine_project<S: MemoryStore + ?Sized>(
     let files = scan_project(
         &project_path,
         options.respect_gitignore,
-        options.include_data_files,
+        options.exclude_data_files,
         options.limit,
     )?;
     let mut summary = MineSummary {
@@ -250,7 +250,7 @@ pub async fn mine_project<S: MemoryStore + ?Sized>(
 pub fn scan_project(
     project_dir: impl AsRef<Path>,
     respect_gitignore: bool,
-    include_data_files: bool,
+    exclude_data_files: bool,
     limit: usize,
 ) -> Result<Vec<PathBuf>> {
     let project_dir = project_dir.as_ref();
@@ -289,7 +289,7 @@ pub fn scan_project(
         if !is_readable_file(entry.path()) {
             continue;
         }
-        if !include_data_files && is_probably_noisy_data_file(entry.path()) {
+        if exclude_data_files && is_probably_noisy_data_file(entry.path()) {
             continue;
         }
 
@@ -722,7 +722,7 @@ mod tests {
     }
 
     #[test]
-    fn scan_project_skips_noisy_data_files_by_default() {
+    fn scan_project_includes_noisy_data_files_by_default() {
         let tmp = tempdir().unwrap();
         let root = tmp.path();
 
@@ -735,10 +735,10 @@ mod tests {
         .unwrap();
 
         let files = scan_project(root, true, false, 0).unwrap();
-        assert!(files.iter().all(|path| !path.ends_with("quests.json")));
+        assert!(files.iter().any(|path| path.ends_with("quests.json")));
 
         let files = scan_project(root, true, true, 0).unwrap();
-        assert!(files.iter().any(|path| path.ends_with("quests.json")));
+        assert!(files.iter().all(|path| !path.ends_with("quests.json")));
     }
 
     #[tokio::test]
