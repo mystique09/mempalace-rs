@@ -1,0 +1,19 @@
+[package]
+name = "mempalace-rs"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "mempalace-rs"
+path = "src/main.rs"
+test = false
+
+[dependencies]
+clap.workspace = true
+mempalace-core = { path = "../../crates/core" }
+mempalace-store = { path = "../../crates/store" }
+tokio.workspace = true
+workspace-hack = { version = "0.1", path = "../../crates/workspace-hack" }
+
+[dev-dependencies]
+tempfile.workspace = true
