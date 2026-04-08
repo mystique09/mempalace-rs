@@ -1,0 +1,37 @@
+[workspace]
+members = ["bin/mempalace-mcp", "bin/mempalace-rs", "crates/core", "crates/mcp", "crates/store", "crates/workspace-hack"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+[workspace.dependencies]
+arrow-array = "57.3.0"
+arrow-schema = "57.3.0"
+async-trait = "0.1.89"
+chrono = { version = "0.4.42", default-features = false, features = ["clock"] }
+clap = { version = "4.5.39", features = ["derive"] }
+dirs = "6.0.0"
+fastembed = { version = "5.13.1", default-features = false, features = ["ort-load-dynamic", "hf-hub-native-tls"] }
+futures = "0.3.31"
+ignore = "0.4.25"
+lancedb = "0.27.2"
+regex = "1.12.2"
+rmcp = { version = "1.2.0", features = ["server", "transport-io", "macros"] }
+rusqlite = { version = "0.39.0", features = ["bundled"] }
+schemars = "1.0.4"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+tempfile = "3.23.0"
+thiserror = "2.0.17"
+tokio = { version = "1.51.0", features = ["macros", "rt-multi-thread"] }
+uuid = { version = "1.18.1", features = ["v7"] }
+
+[profile.dev]
+debug = 0
+codegen-units = 256
+
+[profile.test]
+debug = 0
+codegen-units = 256
