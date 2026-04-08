@@ -1,0 +1,14 @@
+[package]
+name = "mempalace-mcp-bin"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "mempalace-mcp"
+path = "src/main.rs"
+test = false
+
+[dependencies]
+mempalace-mcp = { path = "../../crates/mcp" }
+tokio.workspace = true
+workspace-hack = { version = "0.1", path = "../../crates/workspace-hack" }

@@ -1,0 +1,16 @@
+[package]
+name = "mempalace-mcp"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+chrono.workspace = true
+dirs.workspace = true
+mempalace-core = { path = "../core" }
+mempalace-store = { path = "../store" }
+rmcp.workspace = true
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+workspace-hack = { version = "0.1", path = "../workspace-hack" }

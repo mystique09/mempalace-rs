@@ -1,0 +1,19 @@
+[package]
+name = "mempalace-store"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+arrow-array.workspace = true
+arrow-schema.workspace = true
+async-trait.workspace = true
+dirs.workspace = true
+fastembed.workspace = true
+futures.workspace = true
+lancedb.workspace = true
+mempalace-core = { path = "../core" }
+workspace-hack = { version = "0.1", path = "../workspace-hack" }
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio.workspace = true
