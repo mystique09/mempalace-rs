@@ -89,7 +89,7 @@ cargo run --bin mempalace-mcp
 | `init [DIR]` | Creates global config if needed, optionally writes a project `mempalace.yml`, and runs first-time onboarding in interactive terminals |
 | `status` | Prints total drawer count, store path, KG path, and room counts by wing |
 | `search <QUERY> [SCOPE]` | Runs semantic search with optional wing or room filters; when no explicit wing is supplied, the CLI can infer one from `SCOPE` or the current project root |
-| `mine <DIR>` | Scans readable project files, chunks them into drawers, and writes them into a wing |
+| `mine <DIR>` | Scans text-like project files, skips common binary/media/archive formats, chunks them into drawers, and writes them into a wing |
 | `compress` | Reads stored drawers and emits lossy AAAK summaries, either to stdout (`--dry-run`) or to a generated output file |
 
 Useful flags:
@@ -135,7 +135,7 @@ If the chosen palace path contains a legacy `chroma.sqlite3`, the Rust code auto
 
 The current Rust miner is intentionally simple and predictable:
 
-- It scans common text and source extensions such as `.md`, `.rs`, `.py`, `.ts`, `.json`, `.sql`, and `.toml`.
+- It mines text-like files by default, including unknown extensions and extensionless source files, while skipping common binary, media, archive, and document formats such as `.swf`, `.fla`, `.png`, `.pdf`, and `.zip`.
 - It skips common build and cache directories such as `.git`, `node_modules`, `.venv`, `.next`, `coverage`, and `target`.
 - By default it matches the Python miner and includes readable data files in places like `assets/`, `migrations/`, `fixtures/`, and `seed/`.
 - `mine --exclude-data-files` restores the Rust-only cleaner-index behavior by skipping noisy `.json`, `.csv`, and `.sql` files in those folders.

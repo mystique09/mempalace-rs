@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, HashSet, VecDeque},
     fs,
+    io::Read,
     path::{Component, Path, PathBuf},
 };
 
@@ -15,10 +16,16 @@ const CHUNK_SIZE: usize = 800;
 const CHUNK_OVERLAP: usize = 100;
 const MIN_CHUNK_SIZE: usize = 50;
 const STORE_WRITE_BATCH_SIZE: usize = 256;
+const TEXT_SNIFF_BYTES: usize = 8 * 1024;
+const MAX_BINARY_CONTROL_RATIO_PERCENT: usize = 1;
+const MAX_REPLACEMENT_RATIO_PERCENT: usize = 10;
 
-const READABLE_EXTENSIONS: &[&str] = &[
-    ".txt", ".md", ".py", ".js", ".ts", ".jsx", ".tsx", ".json", ".yaml", ".yml", ".html", ".css",
-    ".java", ".go", ".rs", ".rb", ".sh", ".csv", ".sql", ".toml",
+const BINARY_EXTENSIONS: &[&str] = &[
+    ".7z", ".a", ".avi", ".avif", ".bin", ".bmp", ".bz2", ".class", ".cur", ".db", ".dib", ".dll",
+    ".doc", ".docx", ".dylib", ".eot", ".exe", ".fla", ".flac", ".gif", ".gz", ".ico", ".jar",
+    ".jpeg", ".jpg", ".lib", ".m4a", ".mkv", ".mov", ".mp3", ".mp4", ".o", ".obj", ".ogg", ".otf",
+    ".pdf", ".png", ".ppt", ".pptx", ".pyc", ".pyd", ".so", ".sqlite", ".sqlite3", ".svgz", ".swf",
+    ".tar", ".ttf", ".wav", ".webm", ".webp", ".woff", ".woff2", ".xls", ".xlsx", ".xz", ".zip",
 ];
 const NOISY_DATA_EXTENSIONS: &[&str] = &[".json", ".csv", ".sql"];
 const NOISY_DATA_DIRS: &[&str] = &[
@@ -629,20 +636,15 @@ fn is_readable_file(path: &Path) -> bool {
         return false;
     }
 
-    let Some(extension) = path
-        .extension()
-        .map(|ext| format!(".{}", ext.to_string_lossy().to_lowercase()))
-    else {
+    if has_binary_extension(path) {
         return false;
-    };
-    READABLE_EXTENSIONS.contains(&extension.as_str())
+    }
+
+    is_probably_text_file(path)
 }
 
 fn is_probably_noisy_data_file(path: &Path) -> bool {
-    let Some(extension) = path
-        .extension()
-        .map(|ext| format!(".{}", ext.to_string_lossy().to_lowercase()))
-    else {
+    let Some(extension) = normalized_extension(path) else {
         return false;
     };
 
@@ -665,6 +667,53 @@ fn is_probably_noisy_data_file(path: &Path) -> bool {
     fs::metadata(path)
         .map(|metadata| metadata.len() > MAX_DEFAULT_DATA_FILE_BYTES)
         .unwrap_or(false)
+}
+
+fn has_binary_extension(path: &Path) -> bool {
+    normalized_extension(path)
+        .map(|extension| BINARY_EXTENSIONS.contains(&extension.as_str()))
+        .unwrap_or(false)
+}
+
+fn normalized_extension(path: &Path) -> Option<String> {
+    path.extension()
+        .map(|ext| format!(".{}", ext.to_string_lossy().to_lowercase()))
+}
+
+fn is_probably_text_file(path: &Path) -> bool {
+    let Ok(mut file) = fs::File::open(path) else {
+        return false;
+    };
+
+    let mut sample = [0u8; TEXT_SNIFF_BYTES];
+    let Ok(read) = file.read(&mut sample) else {
+        return false;
+    };
+    let sample = &sample[..read];
+
+    if sample.is_empty() {
+        return true;
+    }
+    if sample.contains(&0) {
+        return false;
+    }
+
+    let control_bytes = sample
+        .iter()
+        .filter(|byte| matches!(byte, 0x01..=0x08 | 0x0B | 0x0C | 0x0E..=0x1F))
+        .count();
+    if control_bytes * 100 > sample.len() * MAX_BINARY_CONTROL_RATIO_PERCENT {
+        return false;
+    }
+
+    let decoded = String::from_utf8_lossy(sample);
+    let decoded_chars = decoded.chars().count();
+    if decoded_chars == 0 {
+        return false;
+    }
+
+    let replacement_chars = decoded.chars().filter(|&ch| ch == '\u{FFFD}').count();
+    replacement_chars * 100 <= decoded_chars * MAX_REPLACEMENT_RATIO_PERCENT
 }
 
 fn load_project_config(project_path: &Path) -> Result<Option<ProjectRoutingConfig>> {
@@ -893,6 +942,37 @@ mod tests {
 
         let files = scan_project(root, true, true, 0).unwrap();
         assert!(files.iter().all(|path| !path.ends_with("quests.json")));
+    }
+
+    #[test]
+    fn scan_project_includes_text_like_files_and_skips_known_binaries() {
+        let tmp = tempdir().unwrap();
+        let root = tmp.path();
+
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("src").join("Avatar.as"),
+            "package {\n  public class Avatar {}\n}\n",
+        )
+        .unwrap();
+        fs::write(root.join("Dockerfile"), "FROM rust:1.87\n").unwrap();
+        fs::write(root.join("notes.custom"), "quest=doomkitten\n").unwrap();
+        fs::write(root.join("movie.swf"), b"FWS\x09\x00\x00\x00\x00\x00\x00").unwrap();
+        fs::write(root.join("project.fla"), b"PK\x03\x04\x14\x00\x00\x00").unwrap();
+        fs::write(root.join("blob.dat"), [0, 159, 146, 150, 0, 1, 2, 3]).unwrap();
+
+        let files = scan_project(root, true, false, 0).unwrap();
+
+        assert!(
+            files
+                .iter()
+                .any(|path| path.ends_with(Path::new("src").join("Avatar.as")))
+        );
+        assert!(files.iter().any(|path| path.ends_with("Dockerfile")));
+        assert!(files.iter().any(|path| path.ends_with("notes.custom")));
+        assert!(files.iter().all(|path| !path.ends_with("movie.swf")));
+        assert!(files.iter().all(|path| !path.ends_with("project.fla")));
+        assert!(files.iter().all(|path| !path.ends_with("blob.dat")));
     }
 
     #[tokio::test]
