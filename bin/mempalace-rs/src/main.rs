@@ -11,6 +11,7 @@ use mempalace_core::{
     SearchQuery, detect_entities, mine_project, scan_for_detection,
 };
 use mempalace_store::LanceMemoryStore;
+use serde::Serialize;
 
 #[derive(Debug, Parser)]
 #[command(name = "mempalace-rs", about = "MemPalace in Rust", version)]
@@ -535,6 +536,7 @@ fn print_init(app: &AppContext) {
 fn should_run_onboarding(config: &MempalaceConfig) -> bool {
     config.mode().is_none()
         || config.topic_wings().is_empty()
+        || !config.entity_registry_path().exists()
         || !config.aaak_entities_path().exists()
         || !config.critical_facts_path().exists()
 }
@@ -610,7 +612,7 @@ fn run_onboarding(
     config.save_people_map(aliases)?;
 
     write_aaak_bootstrap(&config, &people, &projects, &wings, &mode)?;
-    write_entities_config(&app.palace_root.join("entities.json"), &people, &projects)?;
+    write_entity_registry(&config, &people, &projects)?;
 
     println!();
     println!("{:=<58}", "");
@@ -629,8 +631,8 @@ fn run_onboarding(
         config.critical_facts_path().display()
     );
     println!(
-        "  Entity codes: {}",
-        app.palace_root.join("entities.json").display()
+        "  Registry saved to: {}",
+        config.entity_registry_path().display()
     );
     if let Some(directory) = directory {
         println!("  Project dir: {}", directory.display());
@@ -1053,6 +1055,99 @@ fn write_entities_config(
 
     let dialect = AaakDialect::new(entities, Vec::new());
     Ok(dialect.save_config(path.to_path_buf())?)
+}
+
+#[derive(Debug, Serialize)]
+struct EntityRegistryFile {
+    version: u8,
+    mode: String,
+    people: BTreeMap<String, EntityRegistryPerson>,
+    projects: Vec<String>,
+    ambiguous_flags: Vec<String>,
+    wiki_cache: BTreeMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Serialize)]
+struct EntityRegistryPerson {
+    source: &'static str,
+    contexts: Vec<String>,
+    aliases: Vec<String>,
+    relationship: String,
+    confidence: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    canonical: Option<String>,
+}
+
+fn write_entity_registry(
+    config: &MempalaceConfig,
+    people: &[OnboardingPerson],
+    projects: &[String],
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let aliases = config.people_map();
+    let reverse_aliases = aliases
+        .iter()
+        .map(|(alias, canonical)| (canonical.as_str(), alias.as_str()))
+        .collect::<BTreeMap<_, _>>();
+
+    let mut registry_people = BTreeMap::new();
+    for person in people {
+        let alias = reverse_aliases.get(person.name.as_str()).copied();
+        registry_people.insert(
+            person.name.clone(),
+            EntityRegistryPerson {
+                source: "onboarding",
+                contexts: vec![person.context.clone()],
+                aliases: alias.into_iter().map(str::to_owned).collect(),
+                relationship: person.relationship.clone(),
+                confidence: 1.0,
+                canonical: None,
+            },
+        );
+
+        if let Some(alias) = alias {
+            registry_people.insert(
+                alias.to_owned(),
+                EntityRegistryPerson {
+                    source: "onboarding",
+                    contexts: vec![person.context.clone()],
+                    aliases: vec![person.name.clone()],
+                    relationship: person.relationship.clone(),
+                    confidence: 1.0,
+                    canonical: Some(person.name.clone()),
+                },
+            );
+        }
+    }
+
+    let ambiguous_flags = registry_people
+        .keys()
+        .filter_map(|name| is_ambiguous_registry_name(name).then(|| name.to_lowercase()))
+        .collect::<Vec<_>>();
+
+    let raw = serde_json::to_string_pretty(&EntityRegistryFile {
+        version: 1,
+        mode: config.mode().unwrap_or("personal").to_owned(),
+        people: registry_people,
+        projects: projects.to_vec(),
+        ambiguous_flags,
+        wiki_cache: BTreeMap::new(),
+    })?;
+
+    let path = config.entity_registry_path();
+    fs::write(&path, raw)?;
+    Ok(path)
+}
+
+fn is_ambiguous_registry_name(name: &str) -> bool {
+    const COMMON_ENGLISH_WORDS: &[&str] = &[
+        "ever", "grace", "will", "bill", "mark", "april", "may", "june", "joy", "hope", "faith",
+        "chance", "chase", "hunter", "dash", "flash", "star", "sky", "river", "brook", "lane",
+        "art", "clay", "gil", "nat", "max", "rex", "ray",
+    ];
+
+    COMMON_ENGLISH_WORDS
+        .iter()
+        .any(|word| word.eq_ignore_ascii_case(name))
 }
 
 fn next_entity_code(name: &str, existing: &BTreeMap<String, String>) -> String {
@@ -1489,13 +1584,15 @@ fn excerpt(content: &str, max_chars: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use mempalace_core::MempalaceConfig;
     use tempfile::tempdir;
 
     use super::{
         Cli, Command, OnboardingPerson, infer_wing_from_scope, looks_like_project_root,
         resolve_search_wing, run_project_entity_detection, write_aaak_bootstrap,
-        write_project_config_scaffold,
+        write_entity_registry, write_project_config_scaffold,
     };
     use clap::Parser;
 
@@ -1577,15 +1674,30 @@ mod tests {
         }];
         let projects = vec!["mempalace-rs".to_owned()];
         let wings = vec!["family".to_owned(), "projects".to_owned()];
+        let mut aliases = BTreeMap::new();
+        aliases.insert("Rye".to_owned(), "Riley".to_owned());
+        config.save_people_map(aliases).unwrap();
 
         write_aaak_bootstrap(&config, &people, &projects, &wings, "combo").unwrap();
+        write_entity_registry(&config, &people, &projects).unwrap();
 
         let entities = std::fs::read_to_string(config.aaak_entities_path()).unwrap();
         let facts = std::fs::read_to_string(config.critical_facts_path()).unwrap();
+        let registry = std::fs::read_to_string(config.entity_registry_path()).unwrap();
         assert!(entities.contains("RIL=Riley"));
         assert!(entities.contains("MEM=mempalace-rs"));
         assert!(facts.contains("Mode: combo"));
         assert!(facts.contains("Wings: family, projects"));
+        assert!(registry.contains("\"projects\": ["));
+        assert!(registry.contains("\"Riley\""));
+        assert!(registry.contains("\"Rye\""));
+        assert_eq!(
+            config
+                .entity_registry_path()
+                .file_name()
+                .and_then(|name| name.to_str()),
+            Some("entity_registry.json")
+        );
     }
 
     #[test]

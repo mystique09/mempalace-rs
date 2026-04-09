@@ -105,18 +105,19 @@ Useful flags:
 On first run, `init` can ask about work and personal context. That flow writes:
 
 - `~/.mempalace/config.json`
+- `~/.mempalace/entity_registry.json`
 - `~/.mempalace/people_map.json`
 - `~/.mempalace/aaak_entities.md`
 - `~/.mempalace/critical_facts.md`
-- `~/.mempalace/palace/entities.json`
 
-If you pass a project directory to `init`, the CLI also writes a local `mempalace.yml` scaffold. The scaffold uses the directory name as the default wing and derives room names from top-level folders like `src`, `docs`, `assets`, or `tests`.
+If you pass a project directory to `init`, the CLI also writes a local `mempalace.yml` scaffold and may write a project-local `entities.json` when entity detection finds confirmed people or projects. The scaffold uses the directory name as the default wing and derives room names from top-level folders like `src`, `docs`, `assets`, or `tests`.
 
 ## Storage And Configuration
 
 Default runtime files live under `~/.mempalace/`:
 
 - `config.json` - top-level MemPalace config
+- `entity_registry.json` - global onboarding registry for people, aliases, and projects
 - `people_map.json` - optional nickname to canonical-name map
 - `knowledge_graph.sqlite3` - temporal fact storage
 - `fastembed/` - embedding model cache

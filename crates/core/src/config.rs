@@ -134,6 +134,10 @@ impl MempalaceConfig {
         self.config_dir.join("critical_facts.md")
     }
 
+    pub fn entity_registry_path(&self) -> PathBuf {
+        self.config_dir.join("entity_registry.json")
+    }
+
     pub fn init(&self) -> Result<PathBuf> {
         fs::create_dir_all(&self.config_dir)?;
         fs::create_dir_all(self.palace_path())?;

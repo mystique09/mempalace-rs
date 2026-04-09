@@ -3633,6 +3633,8 @@ dependencies = [
  "clap",
  "mempalace-core",
  "mempalace-store",
+ "serde",
+ "serde_json",
  "tempfile",
  "tokio",
  "workspace-hack",
