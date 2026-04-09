@@ -30,6 +30,8 @@ use mempalace_core::{
 };
 
 const DEFAULT_EMBEDDING_MODEL: EmbeddingModel = EmbeddingModel::AllMiniLML6V2;
+// Bound ONNX working-set size when one source file expands into hundreds of chunks.
+const EMBEDDING_BATCH_SIZE: usize = 16;
 const RESULT_COLUMNS: &[&str] = &[
     "id",
     "content",
@@ -814,10 +816,14 @@ impl EmbeddingBackend {
                 let embedder = guard.as_mut().ok_or_else(|| {
                     MempalaceError::Embedding("embedder not initialized".to_owned())
                 })?;
-                let embeddings = embedder
-                    .embed(texts.to_vec(), None)
-                    .map_err(|err| MempalaceError::Embedding(err.to_string()))?;
-                Ok(embeddings.into_iter().map(normalize_vector).collect())
+                let mut embeddings = Vec::with_capacity(texts.len());
+                for batch in embedding_batches(texts) {
+                    let batch_embeddings = embedder
+                        .embed(batch, Some(batch.len()))
+                        .map_err(|err| MempalaceError::Embedding(err.to_string()))?;
+                    embeddings.extend(batch_embeddings.into_iter().map(normalize_vector));
+                }
+                Ok(embeddings)
             }
             #[cfg(test)]
             Self::Deterministic { dim } => Ok(texts
@@ -826,6 +832,10 @@ impl EmbeddingBackend {
                 .collect()),
         }
     }
+}
+
+fn embedding_batches<T>(items: &[T]) -> impl Iterator<Item = &[T]> {
+    items.chunks(EMBEDDING_BATCH_SIZE)
 }
 
 fn sql_escape(value: &str) -> String {
@@ -1045,9 +1055,9 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        Drawer, DrawerMetadata, HYBRID_SCORE_COLUMN, LanceMemoryStore, MemoryStore, SearchHit,
-        SearchQuery, identifier_tokens, identifier_variants, onnxruntime_candidates,
-        rerank_search_hits,
+        Drawer, DrawerMetadata, EMBEDDING_BATCH_SIZE, HYBRID_SCORE_COLUMN, LanceMemoryStore,
+        MemoryStore, SearchHit, SearchQuery, embedding_batches, identifier_tokens,
+        identifier_variants, onnxruntime_candidates, rerank_search_hits,
     };
 
     fn drawer(id: &str, content: &str, wing: &str, room: &str) -> Drawer {
@@ -1314,5 +1324,15 @@ mod tests {
                 .iter()
                 .any(|path| path.ends_with(".mempalace-bin\\onnxruntime.dll"))
         );
+    }
+
+    #[test]
+    fn embedding_batches_limit_onnx_working_set() {
+        let items = (0..(EMBEDDING_BATCH_SIZE * 2 + 1)).collect::<Vec<_>>();
+        let sizes = embedding_batches(&items)
+            .map(|batch| batch.len())
+            .collect::<Vec<_>>();
+
+        assert_eq!(sizes, vec![EMBEDDING_BATCH_SIZE, EMBEDDING_BATCH_SIZE, 1]);
     }
 }

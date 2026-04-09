@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashSet, VecDeque},
     fs,
     path::{Component, Path, PathBuf},
 };
@@ -14,6 +14,7 @@ use crate::{Drawer, DrawerMetadata, MemoryStore, Result};
 const CHUNK_SIZE: usize = 800;
 const CHUNK_OVERLAP: usize = 100;
 const MIN_CHUNK_SIZE: usize = 50;
+const STORE_WRITE_BATCH_SIZE: usize = 256;
 
 const READABLE_EXTENSIONS: &[&str] = &[
     ".txt", ".md", ".py", ".js", ".ts", ".jsx", ".tsx", ".json", ".yaml", ".yml", ".html", ".css",
@@ -160,17 +161,31 @@ pub async fn mine_project<S: MemoryStore + ?Sized>(
         files_scanned: files.len(),
         ..MineSummary::default()
     };
+    let mut pending_drawers = VecDeque::new();
     let mut existing_sources = if options.dry_run {
         HashSet::new()
     } else {
         store.source_files().await?
     };
 
-    for file in files {
+    for (file_index, file) in files.into_iter().enumerate() {
+        let progress = file_index + 1;
+        let display_name = file
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_else(|| file.display().to_string());
         let source_file = file.to_string_lossy().to_string();
         let already_exists = !options.dry_run && existing_sources.contains(&source_file);
         if already_exists && options.skip_existing {
             summary.files_skipped += 1;
+            if options.log_progress {
+                print_skipped_file(
+                    progress,
+                    summary.files_scanned,
+                    &display_name,
+                    "already indexed",
+                );
+            }
             continue;
         }
 
@@ -183,6 +198,9 @@ pub async fn mine_project<S: MemoryStore + ?Sized>(
         let content = content.trim();
         if content.len() < MIN_CHUNK_SIZE {
             summary.files_skipped += 1;
+            if options.log_progress {
+                print_skipped_file(progress, summary.files_scanned, &display_name, "too short");
+            }
             continue;
         }
 
@@ -190,6 +208,9 @@ pub async fn mine_project<S: MemoryStore + ?Sized>(
         let chunks = chunk_text(content);
         if chunks.is_empty() {
             summary.files_skipped += 1;
+            if options.log_progress {
+                print_skipped_file(progress, summary.files_scanned, &display_name, "no chunks");
+            }
             continue;
         }
 
@@ -198,11 +219,7 @@ pub async fn mine_project<S: MemoryStore + ?Sized>(
         *summary.room_counts.entry(room.clone()).or_insert(0) += 1;
         summary.total_drawers += drawer_count;
 
-        if options.log_progress {
-            let display_name = file
-                .file_name()
-                .map(|name| name.to_string_lossy().to_string())
-                .unwrap_or_else(|| file.display().to_string());
+        if options.log_progress && options.dry_run {
             if options.dry_run {
                 println!(
                     "    [DRY RUN] {} -> room:{} ({} drawers)",
@@ -240,11 +257,145 @@ pub async fn mine_project<S: MemoryStore + ?Sized>(
                 },
             })
             .collect::<Vec<_>>();
-        store.add_drawers(drawers).await?;
+        if drawer_count > STORE_WRITE_BATCH_SIZE {
+            let flushed = flush_remaining_drawers(store, &mut pending_drawers).await?;
+            if options.log_progress && flushed > 0 {
+                println!("      flushed {flushed} queued drawers");
+            }
+            add_large_file_drawers(
+                store,
+                drawers,
+                progress,
+                summary.files_scanned,
+                &display_name,
+                options.log_progress,
+            )
+            .await?;
+        } else {
+            pending_drawers.extend(drawers);
+            flush_full_drawer_batches(store, &mut pending_drawers).await?;
+            if options.log_progress {
+                print_processed_file(progress, summary.files_scanned, &display_name, drawer_count);
+            }
+        }
         existing_sources.insert(source_file);
     }
 
+    let flushed = flush_remaining_drawers(store, &mut pending_drawers).await?;
+    if options.log_progress && flushed > 0 {
+        println!("      flushed {flushed} queued drawers");
+    }
+
     Ok(summary)
+}
+
+async fn flush_full_drawer_batches<S: MemoryStore + ?Sized>(
+    store: &S,
+    pending_drawers: &mut VecDeque<Drawer>,
+) -> Result<()> {
+    while pending_drawers.len() >= STORE_WRITE_BATCH_SIZE {
+        let batch = pending_drawers
+            .drain(..STORE_WRITE_BATCH_SIZE)
+            .collect::<Vec<_>>();
+        store.add_drawers(batch).await?;
+    }
+
+    Ok(())
+}
+
+async fn add_large_file_drawers<S: MemoryStore + ?Sized>(
+    store: &S,
+    drawers: Vec<Drawer>,
+    progress: usize,
+    total_files: usize,
+    display_name: &str,
+    log_progress: bool,
+) -> Result<()> {
+    let total_drawers = drawers.len();
+    let total_batches = total_drawers.div_ceil(STORE_WRITE_BATCH_SIZE);
+    let mut processed_drawers = 0usize;
+    let mut pending = VecDeque::from(drawers);
+
+    if log_progress {
+        print_working_file(progress, total_files, display_name, total_drawers);
+    }
+
+    for batch_index in 0..total_batches {
+        let batch = pending
+            .drain(..pending.len().min(STORE_WRITE_BATCH_SIZE))
+            .collect::<Vec<_>>();
+        processed_drawers += batch.len();
+        store.add_drawers(batch).await?;
+        if log_progress {
+            println!(
+                "      batch {}/{} {}/{} drawers",
+                batch_index + 1,
+                total_batches,
+                processed_drawers,
+                total_drawers
+            );
+        }
+    }
+
+    if log_progress {
+        print_processed_file(progress, total_files, display_name, total_drawers);
+    }
+
+    Ok(())
+}
+
+async fn flush_remaining_drawers<S: MemoryStore + ?Sized>(
+    store: &S,
+    pending_drawers: &mut VecDeque<Drawer>,
+) -> Result<usize> {
+    if pending_drawers.is_empty() {
+        return Ok(0);
+    }
+
+    let batch = pending_drawers.drain(..).collect::<Vec<_>>();
+    let flushed = batch.len();
+    store.add_drawers(batch).await?;
+    Ok(flushed)
+}
+
+fn print_processed_file(
+    progress: usize,
+    total_files: usize,
+    display_name: &str,
+    drawer_count: usize,
+) {
+    println!(
+        "  OK  [{:4}/{}] {:50} +{}",
+        progress,
+        total_files,
+        display_name.chars().take(50).collect::<String>(),
+        drawer_count
+    );
+}
+
+fn print_skipped_file(progress: usize, total_files: usize, display_name: &str, reason: &str) {
+    println!(
+        "  SKIP[{:4}/{}] {:50} ({})",
+        progress,
+        total_files,
+        display_name.chars().take(50).collect::<String>(),
+        reason
+    );
+}
+
+fn print_working_file(
+    progress: usize,
+    total_files: usize,
+    display_name: &str,
+    drawer_count: usize,
+) {
+    println!(
+        "  WORK[{:4}/{}] {:50} +{}",
+        progress,
+        total_files,
+        display_name.chars().take(50).collect::<String>(),
+        drawer_count
+    );
 }
 
 pub fn scan_project(
@@ -546,7 +697,7 @@ fn project_config_path(path: &Path) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::HashSet,
+        collections::{HashSet, VecDeque},
         fs,
         path::{Path, PathBuf},
         sync::Mutex,
@@ -555,15 +706,17 @@ mod tests {
     use async_trait::async_trait;
     use tempfile::tempdir;
 
-    use crate::{Drawer, MemoryStore, Result, SearchHit, SearchQuery, StoreStatus};
+    use crate::{Drawer, DrawerMetadata, MemoryStore, Result, SearchHit, SearchQuery, StoreStatus};
 
     use super::{
-        MineOptions, chunk_text, detect_room, load_project_config, mine_project, scan_project,
+        MineOptions, STORE_WRITE_BATCH_SIZE, chunk_text, detect_room, flush_full_drawer_batches,
+        load_project_config, mine_project, scan_project,
     };
 
     #[derive(Default)]
     struct MockStore {
         drawers: Mutex<Vec<Drawer>>,
+        add_drawers_calls: Mutex<usize>,
     }
 
     #[async_trait]
@@ -574,6 +727,7 @@ mod tests {
         }
 
         async fn add_drawers(&self, drawers: Vec<Drawer>) -> Result<()> {
+            *self.add_drawers_calls.lock().unwrap() += 1;
             self.drawers.lock().unwrap().extend(drawers);
             Ok(())
         }
@@ -769,5 +923,57 @@ mod tests {
                 .iter()
                 .any(|drawer| drawer.content.contains("alpha"))
         );
+    }
+
+    #[tokio::test]
+    async fn mine_project_batches_store_writes_across_files() {
+        let tmp = tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::create_dir_all(root.join("docs")).unwrap();
+        fs::write(
+            root.join("src").join("lib.rs"),
+            "fn alpha() {}\n".repeat(20),
+        )
+        .unwrap();
+        fs::write(root.join("docs").join("guide.md"), "# Guide\n".repeat(20)).unwrap();
+
+        let store = MockStore::default();
+        let summary = mine_project(&store, root, &MineOptions::default())
+            .await
+            .unwrap();
+
+        assert_eq!(summary.files_processed, 2);
+        assert_eq!(*store.add_drawers_calls.lock().unwrap(), 1);
+        assert_eq!(store.drawers.lock().unwrap().len(), summary.total_drawers);
+    }
+
+    #[tokio::test]
+    async fn flush_full_drawer_batches_splits_large_pending_sets() {
+        let store = MockStore::default();
+        let mut pending = VecDeque::from(
+            (0..(STORE_WRITE_BATCH_SIZE + 10))
+                .map(|index| Drawer {
+                    id: format!("drawer_{index}"),
+                    content: "chunk".to_owned(),
+                    metadata: DrawerMetadata {
+                        wing: "project".to_owned(),
+                        room: "src".to_owned(),
+                        source_file: Some(format!("drawer_{index}.txt")),
+                        chunk_index: 0,
+                        added_by: "test".to_owned(),
+                        filed_at: Some("2026-04-08T00:00:00".to_owned()),
+                    },
+                })
+                .collect::<Vec<_>>(),
+        );
+
+        flush_full_drawer_batches(&store, &mut pending)
+            .await
+            .unwrap();
+
+        assert_eq!(*store.add_drawers_calls.lock().unwrap(), 1);
+        assert_eq!(store.drawers.lock().unwrap().len(), STORE_WRITE_BATCH_SIZE);
+        assert_eq!(pending.len(), 10);
     }
 }
