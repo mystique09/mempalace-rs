@@ -1,0 +1,47 @@
+name: Hakari Diff Check
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  hakari:
+    runs-on: ubicloud-standard-2
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Rust (nightly)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: nightly
+
+      - name: Run sccache-cache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Install cargo-binstall
+        uses: cargo-bins/cargo-binstall@main
+
+      - name: Install cargo-hakari via binstall
+        run: cargo binstall cargo-hakari --no-confirm
+
+      - name: Cache sccache folder
+        uses: ubicloud/cache@v4
+        with:
+          path: ~/.cache/sccache
+          key: ${{ runner.os }}-sccache-${{ hashFiles('**/*.rs', '**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-sccache-
+
+      - name: Hakari generate diff
+        run: cargo hakari generate --diff
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+          RUSTC_WRAPPER: "sccache"
+
+      - name: Hakari manage-deps diff
+        run: cargo hakari manage-deps --yes
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+          RUSTC_WRAPPER: "sccache"
