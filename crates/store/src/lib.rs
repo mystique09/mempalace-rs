@@ -1,4 +1,5 @@
 use std::{
+    cmp::Ordering,
     collections::{BTreeMap, HashSet},
     env,
     path::{Path, PathBuf},
@@ -416,6 +417,10 @@ impl LanceMemoryStore {
         query.chars().any(char::is_alphanumeric)
     }
 
+    fn retrieval_limit(limit: usize) -> usize {
+        (limit.saturating_mul(8)).clamp(limit, 64)
+    }
+
     async fn vector_batches(
         &self,
         table: &lancedb::Table,
@@ -622,26 +627,39 @@ impl MemoryStore for LanceMemoryStore {
         };
 
         self.ensure_indices(&table).await?;
+        let retrieval_query = SearchQuery {
+            limit: Self::retrieval_limit(query.limit),
+            ..query.clone()
+        };
         let vector = self.embedder.embed(&query.query)?;
         let batches = if Self::supports_full_text_search(&query.query) {
-            match self.hybrid_batches(&table, &query, vector.clone()).await {
+            match self
+                .hybrid_batches(&table, &retrieval_query, vector.clone())
+                .await
+            {
                 Ok(batches) => batches,
-                Err(_) => self.vector_batches(&table, &query, vector).await?,
+                Err(_) => {
+                    self.vector_batches(&table, &retrieval_query, vector)
+                        .await?
+                }
             }
         } else {
-            self.vector_batches(&table, &query, vector).await?
+            self.vector_batches(&table, &retrieval_query, vector)
+                .await?
         };
         let drawers = self.read_drawers(batches.clone())?;
         let scores = self.read_scores(&batches)?;
-
-        Ok(drawers
+        let mut hits = drawers
             .into_iter()
             .enumerate()
             .map(|(index, drawer)| SearchHit {
                 drawer,
                 score: scores.get(index).copied().unwrap_or(0.0),
             })
-            .collect())
+            .collect::<Vec<_>>();
+        rerank_search_hits(&mut hits, &query);
+        hits.truncate(query.limit);
+        Ok(hits)
     }
 
     async fn status(&self) -> Result<StoreStatus> {
@@ -859,6 +877,145 @@ fn normalize_vector(mut values: Vec<f32>) -> Vec<f32> {
     values
 }
 
+fn rerank_search_hits(hits: &mut [SearchHit], query: &SearchQuery) {
+    let tokens = identifier_tokens(&query.query);
+    let variants = identifier_variants(&tokens);
+
+    hits.sort_by(|left, right| {
+        let left_score = boosted_score(left, &tokens, &variants);
+        let right_score = boosted_score(right, &tokens, &variants);
+        right_score
+            .partial_cmp(&left_score)
+            .unwrap_or(Ordering::Equal)
+    });
+}
+
+fn boosted_score(hit: &SearchHit, tokens: &[String], variants: &[String]) -> f32 {
+    let mut score = hit.score;
+    let content = hit.drawer.content.to_ascii_lowercase();
+    let source_file = hit
+        .drawer
+        .metadata
+        .source_file
+        .as_deref()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let file_name = source_file
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(source_file.as_str());
+
+    for variant in variants {
+        if variant.is_empty() {
+            continue;
+        }
+
+        if file_name.contains(variant) {
+            score += 0.9;
+        } else if source_file.contains(variant) {
+            score += 0.6;
+        }
+
+        if content.contains(variant) {
+            score += 0.45;
+        }
+    }
+
+    if !tokens.is_empty() {
+        if tokens.iter().all(|token| file_name.contains(token)) {
+            score += 0.45;
+        } else if tokens.iter().all(|token| source_file.contains(token)) {
+            score += 0.2;
+        }
+
+        if tokens.iter().all(|token| content.contains(token)) {
+            score += 0.15;
+        }
+    }
+
+    if source_file.contains("\\generated\\")
+        || source_file.contains("/generated/")
+        || source_file.contains("\\target\\")
+        || source_file.contains("/target/")
+    {
+        score -= 0.15;
+    }
+
+    score
+}
+
+fn identifier_tokens(text: &str) -> Vec<String> {
+    let mut normalized = String::new();
+    let mut previous_kind = CharacterKind::Boundary;
+
+    for ch in text.chars() {
+        let current_kind = CharacterKind::classify(ch);
+        if current_kind == CharacterKind::Boundary {
+            if !normalized.ends_with(' ') {
+                normalized.push(' ');
+            }
+            previous_kind = CharacterKind::Boundary;
+            continue;
+        }
+
+        if previous_kind == CharacterKind::Lower && current_kind == CharacterKind::Upper {
+            normalized.push(' ');
+        }
+
+        normalized.push(ch.to_ascii_lowercase());
+        previous_kind = current_kind;
+    }
+
+    normalized
+        .split_whitespace()
+        .map(str::to_owned)
+        .collect::<Vec<_>>()
+}
+
+fn identifier_variants(tokens: &[String]) -> Vec<String> {
+    if tokens.is_empty() {
+        return Vec::new();
+    }
+
+    let mut variants = Vec::new();
+    for variant in [
+        tokens.join(" "),
+        tokens.join("_"),
+        tokens.join("-"),
+        tokens.join(""),
+    ] {
+        if !variant.is_empty() && !variants.contains(&variant) {
+            variants.push(variant);
+        }
+    }
+
+    variants
+}
+
+#[derive(Copy, Clone, Eq, PartialEq)]
+enum CharacterKind {
+    Lower,
+    Upper,
+    Digit,
+    Boundary,
+}
+
+impl CharacterKind {
+    fn classify(ch: char) -> Self {
+        if ch.is_ascii_lowercase() {
+            Self::Lower
+        } else if ch.is_ascii_uppercase() {
+            Self::Upper
+        } else if ch.is_ascii_digit() {
+            Self::Digit
+        } else if ch.is_alphanumeric() {
+            Self::Lower
+        } else {
+            Self::Boundary
+        }
+    }
+}
+
 #[cfg(test)]
 fn deterministic_embedding(text: &str, dim: usize) -> Vec<f32> {
     let mut values = vec![0.0; dim];
@@ -888,8 +1045,9 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        Drawer, DrawerMetadata, HYBRID_SCORE_COLUMN, LanceMemoryStore, MemoryStore, SearchQuery,
-        onnxruntime_candidates,
+        Drawer, DrawerMetadata, HYBRID_SCORE_COLUMN, LanceMemoryStore, MemoryStore, SearchHit,
+        SearchQuery, identifier_tokens, identifier_variants, onnxruntime_candidates,
+        rerank_search_hits,
     };
 
     fn drawer(id: &str, content: &str, wing: &str, room: &str) -> Drawer {
@@ -1083,6 +1241,64 @@ mod tests {
                 .any(|batch| batch.column_by_name(HYBRID_SCORE_COLUMN).is_some())
         );
         assert!(scores.iter().any(|score| *score > 0.0));
+    }
+
+    #[test]
+    fn identifier_helpers_cover_code_style_variants() {
+        let tokens = identifier_tokens("FirstJoin");
+        assert_eq!(tokens, vec!["first".to_owned(), "join".to_owned()]);
+
+        let variants = identifier_variants(&tokens);
+        assert!(variants.contains(&"first join".to_owned()));
+        assert!(variants.contains(&"first_join".to_owned()));
+        assert!(variants.contains(&"firstjoin".to_owned()));
+    }
+
+    #[test]
+    fn reranker_boosts_exact_identifier_hits() {
+        let query = SearchQuery::new("first join");
+        let mut hits = vec![
+            SearchHit {
+                drawer: Drawer {
+                    id: "sql".to_owned(),
+                    content: "SELECT first_name FROM users JOIN guilds ON true".to_owned(),
+                    metadata: DrawerMetadata {
+                        wing: "reforged".to_owned(),
+                        room: "crates".to_owned(),
+                        source_file: Some(
+                            r"F:\Dev\reforged\crates\infrastructure\src\repositories\postgres\user\read.rs"
+                                .to_owned(),
+                        ),
+                        chunk_index: 0,
+                        added_by: "test".to_owned(),
+                        filed_at: None,
+                    },
+                },
+                score: 1.0,
+            },
+            SearchHit {
+                drawer: Drawer {
+                    id: "code".to_owned(),
+                    content:
+                        "XtRequest::FirstJoin(_) => { let first_join_request = FirstJoinRequest { socket_id: pid }; }"
+                            .to_owned(),
+                    metadata: DrawerMetadata {
+                        wing: "reforged".to_owned(),
+                        room: "crates".to_owned(),
+                        source_file: Some(
+                            r"F:\Dev\reforged\crates\socket\src\connection.rs".to_owned(),
+                        ),
+                        chunk_index: 0,
+                        added_by: "test".to_owned(),
+                        filed_at: None,
+                    },
+                },
+                score: 0.95,
+            },
+        ];
+
+        rerank_search_hits(&mut hits, &query);
+        assert_eq!(hits[0].drawer.id, "code");
     }
 
     #[test]
