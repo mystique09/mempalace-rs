@@ -27,7 +27,7 @@ jobs:
         run: cargo binstall cargo-hakari --no-confirm
 
       - name: Cache sccache folder
-        uses: ubicloud/cache@v4
+        uses: actions/cache@v4
         with:
           path: ~/.cache/sccache
           key: ${{ runner.os }}-sccache-${{ hashFiles('**/*.rs', '**/Cargo.lock') }}
@@ -37,11 +37,9 @@ jobs:
       - name: Hakari generate diff
         run: cargo hakari generate --diff
         env:
-          SCCACHE_GHA_ENABLED: "true"
           RUSTC_WRAPPER: "sccache"
 
       - name: Hakari manage-deps diff
         run: cargo hakari manage-deps --yes
         env:
-          SCCACHE_GHA_ENABLED: "true"
           RUSTC_WRAPPER: "sccache"

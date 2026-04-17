@@ -1,0 +1,223 @@
+name: Build and Release Android Binaries
+
+on:
+  push:
+    branches: [main]
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+env:
+  TARGET: aarch64-linux-android
+  ANDROID_API_LEVEL: "24"
+
+jobs:
+  build-and-release:
+    runs-on: ubicloud-standard-4
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Run sccache-cache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Install Protoc
+        uses: arduino/setup-protoc@v3
+
+      - name: Set up Rust (nightly)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: nightly
+          targets: ${{ env.TARGET }}
+
+      - name: Set up Android NDK
+        id: setup-ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r27c
+
+      - name: Cache cargo dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo
+          key: ${{ runner.os }}-${{ env.TARGET }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ env.TARGET }}-cargo-
+            ${{ runner.os }}-cargo-
+
+      - name: Cache sccache folder
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/sccache
+          key: ${{ runner.os }}-${{ env.TARGET }}-sccache-${{ hashFiles('**/*.rs', '**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ env.TARGET }}-sccache-
+            ${{ runner.os }}-sccache-
+
+      - name: Build release binaries
+        run: |
+          cargo build --release --timings \
+            --target "$TARGET" \
+            --package mempalace-rs \
+            --package mempalace-mcp-bin
+        env:
+          RUSTC_WRAPPER: "sccache"
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER: ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android${{ env.ANDROID_API_LEVEL }}-clang
+          CARGO_TARGET_AARCH64_LINUX_ANDROID_AR: ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar
+          CC_aarch64_linux_android: ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android${{ env.ANDROID_API_LEVEL }}-clang
+          CXX_aarch64_linux_android: ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android${{ env.ANDROID_API_LEVEL }}-clang++
+          AR_aarch64_linux_android: ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar
+          RANLIB_aarch64_linux_android: ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ranlib
+          PKG_CONFIG_ALLOW_CROSS: "1"
+
+      - name: Publish cargo timings summary
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import html
+          import os
+          import pathlib
+          import re
+
+          summary_path = pathlib.Path(os.environ["GITHUB_STEP_SUMMARY"])
+          report_dir = pathlib.Path("target/cargo-timings")
+
+          if not report_dir.exists():
+              with summary_path.open("a", encoding="utf-8") as summary:
+                  summary.write("## Cargo timings\n\nNo timing report was generated.\n")
+              raise SystemExit(0)
+
+          reports = sorted(
+              report_dir.glob("cargo-timing-*.html"),
+              key=lambda path: path.stat().st_mtime,
+              reverse=True,
+          )
+          report = reports[0] if reports else report_dir / "cargo-timing.html"
+
+          if not report.exists():
+              with summary_path.open("a", encoding="utf-8") as summary:
+                  summary.write("## Cargo timings\n\nNo timing report was generated.\n")
+              raise SystemExit(0)
+
+          def clean(value: str) -> str:
+              value = re.sub(r"<br\s*/?>", " | ", value)
+              value = re.sub(r"<[^>]+>", " ", value)
+              value = html.unescape(value)
+              return " ".join(value.split())
+
+          text = report.read_text(encoding="utf-8", errors="replace")
+
+          summary_table = re.search(
+              r'<table class="my-table summary-table">(.*?)</table>',
+              text,
+              re.S,
+          )
+          metrics = {}
+          if summary_table:
+              for key, value in re.findall(
+                  r"<td>([^<]+):</td><td>(.*?)</td>",
+                  summary_table.group(1),
+                  re.S,
+              ):
+                  metrics[clean(key)] = clean(value)
+
+          units_table = re.search(r'<table class="my-table">(.*?)</table>', text, re.S)
+          top_units = []
+          if units_table:
+              rows = re.findall(r"<tr>(.*?)</tr>", units_table.group(1), re.S)
+              for row in rows[1:6]:
+                  cells = [
+                      clean(cell)
+                      for cell in re.findall(r"<t[dh][^>]*>(.*?)</t[dh]>", row, re.S)
+                  ]
+                  if len(cells) >= 5:
+                      top_units.append((cells[1], cells[2], cells[3], cells[4]))
+
+          with summary_path.open("a", encoding="utf-8") as summary:
+              summary.write("## Cargo timings\n\n")
+              summary.write(f"- Report: `{report}`\n")
+              for key in ("Total time", "Max concurrency", "Fresh units", "Dirty units", "Total units"):
+                  value = metrics.get(key)
+                  if value:
+                      summary.write(f"- {key}: `{value}`\n")
+
+              if top_units:
+                  summary.write("\n### Slowest units\n\n")
+                  summary.write("| Unit | Total | Frontend | Codegen |\n")
+                  summary.write("| --- | --- | --- | --- |\n")
+                  for unit, total, frontend, codegen in top_units:
+                      summary.write(f"| {unit} | {total} | {frontend or '-'} | {codegen or '-'} |\n")
+          PY
+
+      - name: Package release artifacts
+        run: |
+          rm -rf dist
+          mkdir -p dist/stage
+          cp "target/$TARGET/release/mempalace-rs" dist/stage/mempalace-rs
+          cp "target/$TARGET/release/mempalace-mcp" dist/stage/mempalace-mcp
+          tar -C dist/stage -czf "dist/mempalace-rs-$TARGET.tar.gz" mempalace-rs
+          tar -C dist/stage -czf "dist/mempalace-mcp-$TARGET.tar.gz" mempalace-mcp
+          (
+            cd dist
+            sha256sum \
+              "mempalace-rs-$TARGET.tar.gz" \
+              "mempalace-mcp-$TARGET.tar.gz" > SHA256SUMS.txt
+          )
+
+      - name: Upload packaged artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: mempalace-${{ env.TARGET }}-${{ github.sha }}
+          path: |
+            dist/mempalace-rs-${{ env.TARGET }}.tar.gz
+            dist/mempalace-mcp-${{ env.TARGET }}.tar.gz
+            dist/SHA256SUMS.txt
+
+      - name: Publish release summary
+        run: |
+          {
+            echo "## Android release artifacts"
+            echo
+            printf -- '- Target: `%s`\n' "$TARGET"
+            printf -- '- CLI: `dist/mempalace-rs-%s.tar.gz`\n' "$TARGET"
+            printf -- '- MCP: `dist/mempalace-mcp-%s.tar.gz`\n' "$TARGET"
+            echo '- Checksums: `dist/SHA256SUMS.txt`'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Update rolling release tag
+        if: github.ref == 'refs/heads/main'
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git tag -f rolling-android "$GITHUB_SHA"
+          git push origin refs/tags/rolling-android --force
+
+      - name: Publish rolling GitHub release assets
+        if: github.ref == 'refs/heads/main'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: rolling-android
+          name: Rolling Android Release
+          prerelease: true
+          generate_release_notes: false
+          body: |
+            Rolling Android release for `${{ github.sha }}`.
+
+            Target: `${{ env.TARGET }}`
+          files: |
+            dist/mempalace-rs-${{ env.TARGET }}.tar.gz
+            dist/mempalace-mcp-${{ env.TARGET }}.tar.gz
+            dist/SHA256SUMS.txt
+
+      - name: Publish tagged GitHub release assets
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            dist/mempalace-rs-${{ env.TARGET }}.tar.gz
+            dist/mempalace-mcp-${{ env.TARGET }}.tar.gz
+            dist/SHA256SUMS.txt
