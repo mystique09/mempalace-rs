@@ -19,27 +19,22 @@ ahash = { version = "0.8", features = ["serde"] }
 aho-corasick = { version = "1" }
 bytes = { version = "1" }
 either = { version = "1", features = ["use_std"] }
-futures-channel = { version = "0.3", default-features = false, features = ["sink", "std"] }
-futures-task = { version = "0.3", default-features = false, features = ["std"] }
-futures-util = { version = "0.3", features = ["channel", "io", "sink"] }
 getrandom = { version = "0.3", default-features = false, features = ["std"] }
 hashbrown-3575ec1268b04181 = { package = "hashbrown", version = "0.15" }
 hashbrown-986da7b5efc2b80e = { package = "hashbrown", version = "0.16", features = ["serde"] }
 indexmap = { version = "2" }
 memchr = { version = "2" }
 once_cell = { version = "1" }
-percent-encoding = { version = "2" }
 petgraph = { version = "0.8" }
 prost = { version = "0.14" }
 prost-types = { version = "0.14" }
 regex = { version = "1" }
 regex-automata = { version = "0.4", default-features = false, features = ["dfa-onepass", "hybrid", "meta", "nfa", "perf", "std", "unicode"] }
 regex-syntax = { version = "0.8" }
-reqwest = { version = "0.12", features = ["gzip", "json", "multipart", "rustls-tls-native-roots", "stream"] }
 serde = { version = "1", features = ["alloc", "derive", "rc"] }
 serde_core = { version = "1", features = ["alloc", "rc"] }
 serde_json = { version = "1", features = ["alloc"] }
-stable_deref_trait = { version = "1" }
+smallvec = { version = "1", default-features = false, features = ["const_generics"] }
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["codec"] }
 zerocopy = { version = "0.8", default-features = false, features = ["derive", "simd"] }
