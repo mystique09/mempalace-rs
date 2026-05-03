@@ -6,7 +6,7 @@
 
 **Architecture:** Convert the existing release workflow into a build matrix with Android and Windows targets. Matrix jobs package target-specific binaries and upload workflow artifacts; a separate release job aggregates those artifacts and publishes them to GitHub Releases.
 
-**Tech Stack:** GitHub Actions, Rust nightly toolchain, Android NDK, MinGW GNU cross toolchain, Cloudflare R2 S3 uploads, `softprops/action-gh-release`.
+**Tech Stack:** GitHub Actions, Rust stable toolchain, Android NDK, MinGW GNU cross toolchain, Cloudflare R2 S3 uploads, `softprops/action-gh-release`.
 
 ---
 

@@ -41,10 +41,10 @@ jobs:
       - name: Install Protoc
         uses: arduino/setup-protoc@v3
 
-      - name: Set up Rust (nightly)
+      - name: Set up Rust (stable)
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: nightly
+          toolchain: stable
           targets: ${{ matrix.target }}
 
       - name: Set up Android NDK
