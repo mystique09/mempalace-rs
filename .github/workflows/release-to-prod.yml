@@ -1,6 +1,7 @@
-name: Build and Release Android Binaries
+name: Build and Release Binaries
 
 on:
+  pull_request:
   push:
     branches: [main]
     tags:
@@ -8,14 +9,28 @@ on:
   workflow_dispatch:
 
 env:
-  TARGET: aarch64-linux-android
   ANDROID_API_LEVEL: "24"
 
 jobs:
-  build-and-release:
+  build:
+    name: Build ${{ matrix.target }}
     runs-on: ubicloud-standard-4
     permissions:
-      contents: write
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: android
+            target: aarch64-linux-android
+            archive_kind: tar
+            binary_suffix: ""
+          - platform: windows
+            target: x86_64-pc-windows-gnu
+            archive_kind: zip
+            binary_suffix: ".exe"
+    env:
+      TARGET: ${{ matrix.target }}
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -30,33 +45,44 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: nightly
-          targets: ${{ env.TARGET }}
+          targets: ${{ matrix.target }}
 
       - name: Set up Android NDK
+        if: matrix.platform == 'android'
         id: setup-ndk
         uses: nttld/setup-ndk@v1
         with:
           ndk-version: r27c
 
+      - name: Install Windows cross toolchain
+        if: matrix.platform == 'windows'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            gcc-mingw-w64-x86-64 \
+            g++-mingw-w64-x86-64 \
+            zip
+
       - name: Cache cargo dependencies
         uses: actions/cache@v4
         with:
           path: ~/.cargo
-          key: ${{ runner.os }}-${{ env.TARGET }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-${{ env.TARGET }}-cargo-
+            ${{ runner.os }}-${{ matrix.target }}-cargo-
             ${{ runner.os }}-cargo-
 
       - name: Cache sccache folder
         uses: actions/cache@v4
         with:
           path: ~/.cache/sccache
-          key: ${{ runner.os }}-${{ env.TARGET }}-sccache-${{ hashFiles('**/*.rs', '**/Cargo.lock') }}
+          key: ${{ runner.os }}-${{ matrix.target }}-sccache-${{ hashFiles('**/*.rs', '**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-${{ env.TARGET }}-sccache-
+            ${{ runner.os }}-${{ matrix.target }}-sccache-
             ${{ runner.os }}-sccache-
 
-      - name: Build release binaries
+      - name: Build Android release binaries
+        if: matrix.platform == 'android'
         run: |
           cargo build --release --timings \
             --target "$TARGET" \
@@ -71,6 +97,23 @@ jobs:
           CXX_aarch64_linux_android: ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android${{ env.ANDROID_API_LEVEL }}-clang++
           AR_aarch64_linux_android: ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar
           RANLIB_aarch64_linux_android: ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ranlib
+          PKG_CONFIG_ALLOW_CROSS: "1"
+
+      - name: Build Windows release binaries
+        if: matrix.platform == 'windows'
+        run: |
+          cargo build --release --timings \
+            --target "$TARGET" \
+            --package mempalace-rs \
+            --package mempalace-mcp-bin
+        env:
+          RUSTC_WRAPPER: "sccache"
+          CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER: x86_64-w64-mingw32-gcc
+          CARGO_TARGET_X86_64_PC_WINDOWS_GNU_AR: x86_64-w64-mingw32-ar
+          CC_x86_64_pc_windows_gnu: x86_64-w64-mingw32-gcc
+          CXX_x86_64_pc_windows_gnu: x86_64-w64-mingw32-g++
+          AR_x86_64_pc_windows_gnu: x86_64-w64-mingw32-ar
+          RANLIB_x86_64_pc_windows_gnu: x86_64-w64-mingw32-ranlib
           PKG_CONFIG_ALLOW_CROSS: "1"
 
       - name: Publish cargo timings summary
@@ -137,7 +180,7 @@ jobs:
                       top_units.append((cells[1], cells[2], cells[3], cells[4]))
 
           with summary_path.open("a", encoding="utf-8") as summary:
-              summary.write("## Cargo timings\n\n")
+              summary.write(f"## Cargo timings: {os.environ['TARGET']}\n\n")
               summary.write(f"- Report: `{report}`\n")
               for key in ("Total time", "Max concurrency", "Fresh units", "Dirty units", "Total units"):
                   value = metrics.get(key)
@@ -154,20 +197,52 @@ jobs:
 
       - name: Package release artifacts
         run: |
+          set -euo pipefail
+
           rm -rf dist
-          mkdir -p dist/stage
-          cp "target/$TARGET/release/mempalace-rs" dist/stage/mempalace-rs
-          cp "target/$TARGET/release/mempalace-mcp" dist/stage/mempalace-mcp
-          tar -C dist/stage -czf "dist/mempalace-rs-$TARGET.tar.gz" mempalace-rs
-          tar -C dist/stage -czf "dist/mempalace-mcp-$TARGET.tar.gz" mempalace-mcp
+          mkdir -p dist/stage dist/out
+
+          binary_suffix="${{ matrix.binary_suffix }}"
+          archive_kind="${{ matrix.archive_kind }}"
+          cli_name="mempalace-rs${binary_suffix}"
+          mcp_name="mempalace-mcp${binary_suffix}"
+
+          cp "target/$TARGET/release/${cli_name}" "dist/stage/${cli_name}"
+          cp "target/$TARGET/release/${mcp_name}" "dist/stage/${mcp_name}"
+
+          if [[ "$archive_kind" == "zip" ]]; then
+            (
+              cd dist/stage
+              zip -q "../out/mempalace-rs-${TARGET}.zip" "$cli_name"
+              zip -q "../out/mempalace-mcp-${TARGET}.zip" "$mcp_name"
+            )
+          else
+            tar -C dist/stage -czf "dist/out/mempalace-rs-${TARGET}.tar.gz" "$cli_name"
+            tar -C dist/stage -czf "dist/out/mempalace-mcp-${TARGET}.tar.gz" "$mcp_name"
+          fi
+
           (
-            cd dist
-            sha256sum \
-              "mempalace-rs-$TARGET.tar.gz" \
-              "mempalace-mcp-$TARGET.tar.gz" > SHA256SUMS.txt
+            cd dist/out
+            sha256sum mempalace-rs-* mempalace-mcp-* > "SHA256SUMS-${TARGET}.txt"
           )
 
+      - name: Upload packaged workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-binaries-${{ matrix.target }}
+          path: dist/out/*
+          if-no-files-found: error
+
+      - name: Install AWS CLI
+        if: github.event_name != 'pull_request'
+        run: |
+          if ! command -v aws >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends awscli
+          fi
+
       - name: Upload packaged artifacts to Cloudflare R2
+        if: github.event_name != 'pull_request'
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.CLOUDFLARE_R2_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.CLOUDFLARE_R2_SECRET_ACCESS_KEY }}
@@ -176,6 +251,7 @@ jobs:
           R2_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_R2_ACCOUNT_ID }}
           R2_BUCKET: ${{ secrets.CLOUDFLARE_R2_BUCKET }}
           R2_PUBLIC_BASE_URL: ${{ vars.CLOUDFLARE_R2_PUBLIC_BASE_URL }}
+          PLATFORM: ${{ matrix.platform }}
         run: |
           set -euo pipefail
 
@@ -185,24 +261,20 @@ jobs:
           : "${AWS_SECRET_ACCESS_KEY:?missing CLOUDFLARE_R2_SECRET_ACCESS_KEY secret}"
 
           endpoint="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
-          commit_prefix="mempalace/android/${TARGET}/commits/${GITHUB_SHA}"
+          commit_prefix="mempalace/${PLATFORM}/${TARGET}/commits/${GITHUB_SHA}"
           destinations=("$commit_prefix")
 
           if [[ "${GITHUB_REF}" == "refs/heads/main" ]]; then
-            rolling_prefix="mempalace/android/${TARGET}/rolling"
+            rolling_prefix="mempalace/${PLATFORM}/${TARGET}/rolling"
             destinations+=("$rolling_prefix")
           fi
 
           if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
-            tag_prefix="mempalace/android/${TARGET}/tags/${GITHUB_REF_NAME}"
+            tag_prefix="mempalace/${PLATFORM}/${TARGET}/tags/${GITHUB_REF_NAME}"
             destinations+=("$tag_prefix")
           fi
 
-          files=(
-            "dist/mempalace-rs-${TARGET}.tar.gz"
-            "dist/mempalace-mcp-${TARGET}.tar.gz"
-            "dist/SHA256SUMS.txt"
-          )
+          mapfile -t files < <(find dist/out -maxdepth 1 -type f | sort)
 
           for prefix in "${destinations[@]}"; do
             for file in "${files[@]}"; do
@@ -236,16 +308,21 @@ jobs:
             fi
           } >> "$GITHUB_ENV"
 
-      - name: Publish release summary
+      - name: Publish build summary
         run: |
           {
-            echo "## Android release artifacts"
+            echo "## Release artifacts: $TARGET"
             echo
+            printf -- '- Platform: `%s`\n' "${{ matrix.platform }}"
             printf -- '- Target: `%s`\n' "$TARGET"
-            printf -- '- CLI: `dist/mempalace-rs-%s.tar.gz`\n' "$TARGET"
-            printf -- '- MCP: `dist/mempalace-mcp-%s.tar.gz`\n' "$TARGET"
-            echo '- Checksums: `dist/SHA256SUMS.txt`'
+            echo
+            echo "### Files"
+            echo
+            for file in dist/out/*; do
+              printf -- '- `%s`\n' "$(basename "$file")"
+            done
             if [[ -n "${R2_ARTIFACT_PREFIX:-}" ]]; then
+              echo
               printf -- '- R2 commit prefix: `%s`\n' "$R2_ARTIFACT_PREFIX"
             fi
             if [[ -n "${R2_ROLLING_PREFIX:-}" ]]; then
@@ -255,21 +332,45 @@ jobs:
               printf -- '- R2 tag prefix: `%s`\n' "$R2_TAG_PREFIX"
             fi
             if [[ -n "${R2_ARTIFACTS_PUBLIC_BASE:-}" ]]; then
-              printf -- '- R2 commit CLI URL: `%s/mempalace-rs-%s.tar.gz`\n' "$R2_ARTIFACTS_PUBLIC_BASE" "$TARGET"
-              printf -- '- R2 commit MCP URL: `%s/mempalace-mcp-%s.tar.gz`\n' "$R2_ARTIFACTS_PUBLIC_BASE" "$TARGET"
-              printf -- '- R2 commit checksums URL: `%s/SHA256SUMS.txt`\n' "$R2_ARTIFACTS_PUBLIC_BASE"
+              printf -- '- R2 commit URL base: `%s`\n' "$R2_ARTIFACTS_PUBLIC_BASE"
             fi
             if [[ -n "${R2_ROLLING_PUBLIC_BASE:-}" ]]; then
-              printf -- '- R2 rolling CLI URL: `%s/mempalace-rs-%s.tar.gz`\n' "$R2_ROLLING_PUBLIC_BASE" "$TARGET"
-              printf -- '- R2 rolling MCP URL: `%s/mempalace-mcp-%s.tar.gz`\n' "$R2_ROLLING_PUBLIC_BASE" "$TARGET"
-              printf -- '- R2 rolling checksums URL: `%s/SHA256SUMS.txt`\n' "$R2_ROLLING_PUBLIC_BASE"
+              printf -- '- R2 rolling URL base: `%s`\n' "$R2_ROLLING_PUBLIC_BASE"
             fi
             if [[ -n "${R2_TAG_PUBLIC_BASE:-}" ]]; then
-              printf -- '- R2 tag CLI URL: `%s/mempalace-rs-%s.tar.gz`\n' "$R2_TAG_PUBLIC_BASE" "$TARGET"
-              printf -- '- R2 tag MCP URL: `%s/mempalace-mcp-%s.tar.gz`\n' "$R2_TAG_PUBLIC_BASE" "$TARGET"
-              printf -- '- R2 tag checksums URL: `%s/SHA256SUMS.txt`\n' "$R2_TAG_PUBLIC_BASE"
+              printf -- '- R2 tag URL base: `%s`\n' "$R2_TAG_PUBLIC_BASE"
             fi
           } >> "$GITHUB_STEP_SUMMARY"
+
+  release:
+    name: Publish GitHub release
+    runs-on: ubicloud-standard-4
+    needs: build
+    if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download packaged artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-binaries-*
+          path: dist
+          merge-multiple: true
+
+      - name: Generate aggregate checksums
+        run: |
+          set -euo pipefail
+          (
+            cd dist
+            rm -f SHA256SUMS.txt
+            sha256sum mempalace-rs-* mempalace-mcp-* > SHA256SUMS.txt
+          )
+          ls -la dist
 
       - name: Update rolling release tag
         if: github.ref == 'refs/heads/main'
@@ -284,17 +385,17 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: rolling-android
-          name: Rolling Android Release
+          name: Rolling Release
           prerelease: true
           generate_release_notes: false
           body: |
-            Rolling Android release for `${{ github.sha }}`.
+            Rolling release for `${{ github.sha }}`.
 
-            Target: `${{ env.TARGET }}`
+            Targets:
+            - `aarch64-linux-android`
+            - `x86_64-pc-windows-gnu`
           files: |
-            dist/mempalace-rs-${{ env.TARGET }}.tar.gz
-            dist/mempalace-mcp-${{ env.TARGET }}.tar.gz
-            dist/SHA256SUMS.txt
+            dist/*
 
       - name: Publish tagged GitHub release assets
         if: startsWith(github.ref, 'refs/tags/v')
@@ -302,6 +403,14 @@ jobs:
         with:
           generate_release_notes: true
           files: |
-            dist/mempalace-rs-${{ env.TARGET }}.tar.gz
-            dist/mempalace-mcp-${{ env.TARGET }}.tar.gz
-            dist/SHA256SUMS.txt
+            dist/*
+
+      - name: Publish release summary
+        run: |
+          {
+            echo "## GitHub release assets"
+            echo
+            for file in dist/*; do
+              printf -- '- `%s`\n' "$(basename "$file")"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"

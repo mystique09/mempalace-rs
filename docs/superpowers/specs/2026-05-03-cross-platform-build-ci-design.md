@@ -2,7 +2,7 @@
 
 ## Goal
 
-Add CI that builds release binaries for the Rust workspace on Android and Windows without using a Windows runner.
+Add CI that builds release binaries for the Rust workspace on Android and Windows without using a Windows runner, then attaches those binaries to GitHub releases.
 
 ## Scope
 
@@ -20,7 +20,7 @@ The workflow should run on `ubicloud-standard-4`.
 
 ## Approach
 
-Create a dedicated GitHub Actions workflow for build validation and artifact upload. Keep the existing Android release workflow unchanged because it publishes rolling and tagged release artifacts to Cloudflare R2 and GitHub Releases.
+Extend the existing release workflow because it already publishes rolling and tagged release artifacts to Cloudflare R2 and GitHub Releases.
 
 Use a target matrix so Android and Windows share the same workflow structure while keeping target-specific setup steps explicit:
 
@@ -28,6 +28,8 @@ Use a target matrix so Android and Windows share the same workflow structure whi
 - Windows installs Rust target support and the MinGW cross toolchain, then builds `x86_64-pc-windows-gnu` from Linux.
 
 Both matrix jobs compile `mempalace-rs` and `mempalace-mcp-bin` in release mode, package the produced binaries, generate checksums, and upload the archives through GitHub Actions artifacts.
+
+A release job should download the packaged matrix artifacts, generate an aggregate checksum file, update the rolling release on pushes to `main`, and attach all Android and Windows packages to rolling and tagged GitHub releases.
 
 ## Packaging
 
@@ -41,11 +43,11 @@ Windows artifacts should be zip files containing `.exe` binaries:
 - `mempalace-rs-x86_64-pc-windows-gnu.zip`
 - `mempalace-mcp-x86_64-pc-windows-gnu.zip`
 
-Each target should include a `SHA256SUMS.txt` file in the uploaded artifact bundle.
+Each target should include a target-specific checksum file in the uploaded artifact bundle. The release job should also publish an aggregate `SHA256SUMS.txt`.
 
 ## Triggers
 
-Run on pull requests, pushes to `main`, and manual dispatch. This makes the workflow useful as CI without changing the existing release process.
+Run on pull requests, pushes to `main`, tags matching `v*`, and manual dispatch. Pull requests should build and upload GitHub Actions artifacts only. Pushes to `main` and tags should also publish release assets.
 
 ## Error Handling
 
