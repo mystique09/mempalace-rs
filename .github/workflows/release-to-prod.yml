@@ -64,7 +64,7 @@ jobs:
             zip
 
       - name: Cache cargo dependencies
-        uses: actions/cache@v4
+        uses: ubicloud/cache@v4
         with:
           path: ~/.cargo
           key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
@@ -73,7 +73,7 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: Cache sccache folder
-        uses: actions/cache@v4
+        uses: ubicloud/cache@v4
         with:
           path: ~/.cache/sccache
           key: ${{ runner.os }}-${{ matrix.target }}-sccache-${{ hashFiles('**/*.rs', '**/Cargo.lock') }}
