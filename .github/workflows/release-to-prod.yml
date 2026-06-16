@@ -247,81 +247,6 @@ jobs:
           path: dist/out/*
           if-no-files-found: error
 
-      - name: Install AWS CLI
-        if: github.event_name != 'pull_request'
-        run: |
-          if ! command -v aws >/dev/null 2>&1; then
-            sudo apt-get update
-            sudo apt-get install -y --no-install-recommends awscli
-          fi
-
-      - name: Upload packaged artifacts to Cloudflare R2
-        if: github.event_name != 'pull_request'
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.CLOUDFLARE_R2_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.CLOUDFLARE_R2_SECRET_ACCESS_KEY }}
-          AWS_REGION: auto
-          AWS_DEFAULT_REGION: auto
-          R2_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_R2_ACCOUNT_ID }}
-          R2_BUCKET: ${{ secrets.CLOUDFLARE_R2_BUCKET }}
-          R2_PUBLIC_BASE_URL: ${{ vars.CLOUDFLARE_R2_PUBLIC_BASE_URL }}
-          PLATFORM: ${{ matrix.platform }}
-        run: |
-          set -euo pipefail
-
-          : "${R2_ACCOUNT_ID:?missing CLOUDFLARE_R2_ACCOUNT_ID secret}"
-          : "${R2_BUCKET:?missing CLOUDFLARE_R2_BUCKET secret}"
-          : "${AWS_ACCESS_KEY_ID:?missing CLOUDFLARE_R2_ACCESS_KEY_ID secret}"
-          : "${AWS_SECRET_ACCESS_KEY:?missing CLOUDFLARE_R2_SECRET_ACCESS_KEY secret}"
-
-          endpoint="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
-          commit_prefix="mempalace/${PLATFORM}/${TARGET}/commits/${GITHUB_SHA}"
-          destinations=("$commit_prefix")
-
-          if [[ "${GITHUB_REF}" == "refs/heads/main" ]]; then
-            rolling_prefix="mempalace/${PLATFORM}/${TARGET}/rolling"
-            destinations+=("$rolling_prefix")
-          fi
-
-          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
-            tag_prefix="mempalace/${PLATFORM}/${TARGET}/tags/${GITHUB_REF_NAME}"
-            destinations+=("$tag_prefix")
-          fi
-
-          mapfile -t files < <(find dist/out -maxdepth 1 -type f | sort)
-
-          for prefix in "${destinations[@]}"; do
-            for file in "${files[@]}"; do
-              aws s3 cp \
-                "$file" \
-                "s3://${R2_BUCKET}/${prefix}/$(basename "$file")" \
-                --endpoint-url "$endpoint"
-            done
-          done
-
-          {
-            echo "R2_ARTIFACT_PREFIX=${commit_prefix}"
-
-            if [[ -n "${R2_PUBLIC_BASE_URL:-}" ]]; then
-              public_base="${R2_PUBLIC_BASE_URL%/}"
-              echo "R2_ARTIFACTS_PUBLIC_BASE=${public_base}/${commit_prefix}"
-            fi
-
-            if [[ -n "${rolling_prefix:-}" ]]; then
-              echo "R2_ROLLING_PREFIX=${rolling_prefix}"
-              if [[ -n "${R2_PUBLIC_BASE_URL:-}" ]]; then
-                echo "R2_ROLLING_PUBLIC_BASE=${public_base}/${rolling_prefix}"
-              fi
-            fi
-
-            if [[ -n "${tag_prefix:-}" ]]; then
-              echo "R2_TAG_PREFIX=${tag_prefix}"
-              if [[ -n "${R2_PUBLIC_BASE_URL:-}" ]]; then
-                echo "R2_TAG_PUBLIC_BASE=${public_base}/${tag_prefix}"
-              fi
-            fi
-          } >> "$GITHUB_ENV"
-
       - name: Publish build summary
         run: |
           {
@@ -335,25 +260,6 @@ jobs:
             for file in dist/out/*; do
               printf -- '- `%s`\n' "$(basename "$file")"
             done
-            if [[ -n "${R2_ARTIFACT_PREFIX:-}" ]]; then
-              echo
-              printf -- '- R2 commit prefix: `%s`\n' "$R2_ARTIFACT_PREFIX"
-            fi
-            if [[ -n "${R2_ROLLING_PREFIX:-}" ]]; then
-              printf -- '- R2 rolling prefix: `%s`\n' "$R2_ROLLING_PREFIX"
-            fi
-            if [[ -n "${R2_TAG_PREFIX:-}" ]]; then
-              printf -- '- R2 tag prefix: `%s`\n' "$R2_TAG_PREFIX"
-            fi
-            if [[ -n "${R2_ARTIFACTS_PUBLIC_BASE:-}" ]]; then
-              printf -- '- R2 commit URL base: `%s`\n' "$R2_ARTIFACTS_PUBLIC_BASE"
-            fi
-            if [[ -n "${R2_ROLLING_PUBLIC_BASE:-}" ]]; then
-              printf -- '- R2 rolling URL base: `%s`\n' "$R2_ROLLING_PUBLIC_BASE"
-            fi
-            if [[ -n "${R2_TAG_PUBLIC_BASE:-}" ]]; then
-              printf -- '- R2 tag URL base: `%s`\n' "$R2_TAG_PUBLIC_BASE"
-            fi
           } >> "$GITHUB_STEP_SUMMARY"
 
   release:
