@@ -10,8 +10,10 @@ use mempalace_core::{
     AaakDialect, DetectedEntities, KnowledgeGraph, MemoryStore, MempalaceConfig, MineOptions,
     SearchQuery, detect_entities, mine_project, scan_for_detection,
 };
+use mempalace_mcp::McpServer;
 use mempalace_store::LanceMemoryStore;
 use serde::Serialize;
+use serde_json::Value;
 
 #[derive(Debug, Parser)]
 #[command(name = "mempalace-rs", about = "MemPalace in Rust", version)]
@@ -74,6 +76,117 @@ enum Command {
         #[arg(long)]
         no_gitignore: bool,
     },
+    Tool {
+        #[command(subcommand)]
+        command: ToolCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+#[command(rename_all = "snake_case")]
+enum ToolCommand {
+    Status,
+    ListWings,
+    ListRooms {
+        #[arg(long)]
+        wing: Option<String>,
+    },
+    GetTaxonomy,
+    GetAaakSpec,
+    Search {
+        #[arg(long)]
+        query: String,
+        #[arg(long, default_value_t = 5)]
+        limit: usize,
+        #[arg(long)]
+        wing: Option<String>,
+        #[arg(long)]
+        room: Option<String>,
+    },
+    CheckDuplicate {
+        #[arg(long)]
+        content: String,
+        #[arg(long, default_value_t = 0.9)]
+        threshold: f32,
+    },
+    AddDrawer {
+        #[arg(long)]
+        wing: String,
+        #[arg(long)]
+        room: String,
+        #[arg(long)]
+        content: String,
+        #[arg(long = "source-file")]
+        source_file: Option<String>,
+        #[arg(long = "added-by", default_value = "cli")]
+        added_by: String,
+    },
+    DeleteDrawer {
+        #[arg(long = "drawer-id")]
+        drawer_id: String,
+    },
+    KgQuery {
+        #[arg(long)]
+        entity: String,
+        #[arg(long = "as-of")]
+        as_of: Option<String>,
+        #[arg(long, default_value = "both")]
+        direction: String,
+    },
+    KgAdd {
+        #[arg(long)]
+        subject: String,
+        #[arg(long)]
+        predicate: String,
+        #[arg(long)]
+        object: String,
+        #[arg(long = "valid-from")]
+        valid_from: Option<String>,
+        #[arg(long = "source-closet")]
+        source_closet: Option<String>,
+    },
+    KgInvalidate {
+        #[arg(long)]
+        subject: String,
+        #[arg(long)]
+        predicate: String,
+        #[arg(long)]
+        object: String,
+        #[arg(long = "ended")]
+        ended: Option<String>,
+    },
+    KgTimeline {
+        #[arg(long)]
+        entity: Option<String>,
+    },
+    KgStats,
+    DiaryWrite {
+        #[arg(long = "agent-name")]
+        agent_name: String,
+        #[arg(long)]
+        entry: String,
+        #[arg(long, default_value = "general")]
+        topic: String,
+    },
+    DiaryRead {
+        #[arg(long = "agent-name")]
+        agent_name: String,
+        #[arg(long = "last-n", default_value_t = 10)]
+        last_n: usize,
+    },
+    Traverse {
+        #[arg(long = "start-room")]
+        start_room: String,
+        #[arg(long = "max-hops", default_value_t = 2)]
+        max_hops: usize,
+    },
+    FindTunnels {
+        #[arg(long = "wing-a")]
+        wing_a: Option<String>,
+        #[arg(long = "wing-b")]
+        wing_b: Option<String>,
+    },
+    GraphStats,
 }
 
 struct AppContext {
@@ -247,8 +360,119 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
             .await?;
         }
+        Command::Tool { command } => {
+            let server = McpServer::open_with_palace(cli.palace).await?;
+            run_tool_command(&server, command).await?;
+        }
     }
 
+    Ok(())
+}
+
+async fn run_tool_command(
+    server: &McpServer,
+    command: ToolCommand,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let value = match command {
+        ToolCommand::Status => server.tool_status().await.map_err(io::Error::other)?,
+        ToolCommand::ListWings => server.tool_list_wings().await.map_err(io::Error::other)?,
+        ToolCommand::ListRooms { wing } => server
+            .tool_list_rooms(wing)
+            .await
+            .map_err(io::Error::other)?,
+        ToolCommand::GetTaxonomy => server.tool_get_taxonomy().await.map_err(io::Error::other)?,
+        ToolCommand::GetAaakSpec => server.tool_get_aaak_spec(),
+        ToolCommand::Search {
+            query,
+            limit,
+            wing,
+            room,
+        } => server
+            .tool_search(query, limit, wing, room)
+            .await
+            .map_err(io::Error::other)?,
+        ToolCommand::CheckDuplicate { content, threshold } => server
+            .tool_check_duplicate(content, threshold)
+            .await
+            .map_err(io::Error::other)?,
+        ToolCommand::AddDrawer {
+            wing,
+            room,
+            content,
+            source_file,
+            added_by,
+        } => server
+            .tool_add_drawer(wing, room, content, source_file, added_by)
+            .await
+            .map_err(io::Error::other)?,
+        ToolCommand::DeleteDrawer { drawer_id } => server
+            .tool_delete_drawer(drawer_id)
+            .await
+            .map_err(io::Error::other)?,
+        ToolCommand::KgQuery {
+            entity,
+            as_of,
+            direction,
+        } => server
+            .tool_kg_query(entity, as_of, direction)
+            .await
+            .map_err(io::Error::other)?,
+        ToolCommand::KgAdd {
+            subject,
+            predicate,
+            object,
+            valid_from,
+            source_closet,
+        } => server
+            .tool_kg_add(subject, predicate, object, valid_from, source_closet)
+            .await
+            .map_err(io::Error::other)?,
+        ToolCommand::KgInvalidate {
+            subject,
+            predicate,
+            object,
+            ended,
+        } => server
+            .tool_kg_invalidate(subject, predicate, object, ended)
+            .await
+            .map_err(io::Error::other)?,
+        ToolCommand::KgTimeline { entity } => server
+            .tool_kg_timeline(entity)
+            .await
+            .map_err(io::Error::other)?,
+        ToolCommand::KgStats => server.tool_kg_stats().await.map_err(io::Error::other)?,
+        ToolCommand::DiaryWrite {
+            agent_name,
+            entry,
+            topic,
+        } => server
+            .tool_diary_write(agent_name, entry, topic)
+            .await
+            .map_err(io::Error::other)?,
+        ToolCommand::DiaryRead { agent_name, last_n } => server
+            .tool_diary_read(agent_name, last_n)
+            .await
+            .map_err(io::Error::other)?,
+        ToolCommand::Traverse {
+            start_room,
+            max_hops,
+        } => server
+            .tool_traverse(start_room, max_hops)
+            .await
+            .map_err(io::Error::other)?,
+        ToolCommand::FindTunnels { wing_a, wing_b } => server
+            .tool_find_tunnels(wing_a, wing_b)
+            .await
+            .map_err(io::Error::other)?,
+        ToolCommand::GraphStats => server.tool_graph_stats().await.map_err(io::Error::other)?,
+    };
+
+    print_json(&value)?;
+    Ok(())
+}
+
+fn print_json(value: &Value) -> Result<(), Box<dyn std::error::Error>> {
+    println!("{}", serde_json::to_string_pretty(value)?);
     Ok(())
 }
 
@@ -453,6 +677,10 @@ async fn open_context(
     let config = MempalaceConfig::load()?;
     config.init()?;
 
+    let knowledge_graph_path = palace_override
+        .as_deref()
+        .map(MempalaceConfig::knowledge_graph_path_for_palace)
+        .unwrap_or_else(|| config.knowledge_graph_path());
     let palace_root = palace_override.unwrap_or_else(|| config.palace_path());
     let store_path = MempalaceConfig::resolve_store_path(&palace_root);
     let fastembed_cache_path = config.fastembed_cache_path();
@@ -464,7 +692,7 @@ async fn open_context(
 
     let store =
         LanceMemoryStore::new(&store_path, config.collection_name(), &fastembed_cache_path)?;
-    let graph = KnowledgeGraph::new(config.knowledge_graph_path())?;
+    let graph = KnowledgeGraph::new(knowledge_graph_path)?;
 
     Ok(AppContext {
         config,
@@ -1590,9 +1818,9 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        Cli, Command, OnboardingPerson, infer_wing_from_scope, looks_like_project_root,
-        resolve_search_wing, run_project_entity_detection, write_aaak_bootstrap,
-        write_entity_registry, write_project_config_scaffold,
+        Cli, Command, OnboardingPerson, ToolCommand, infer_wing_from_scope,
+        looks_like_project_root, resolve_search_wing, run_project_entity_detection,
+        write_aaak_bootstrap, write_entity_registry, write_project_config_scaffold,
     };
     use clap::Parser;
 
@@ -1610,6 +1838,61 @@ mod tests {
         let cli = Cli::try_parse_from(["mempalace-rs", "init", "."]).unwrap();
         match cli.command {
             Command::Init { dir, .. } => assert_eq!(dir, Some(".".into())),
+            command => panic!("unexpected command parsed: {command:?}"),
+        }
+    }
+
+    #[test]
+    fn tool_namespace_accepts_mcp_style_subcommands() {
+        let cli = Cli::try_parse_from(["mempalace-rs", "tool", "list_wings"]).unwrap();
+        match cli.command {
+            Command::Tool {
+                command: ToolCommand::ListWings,
+            } => {}
+            command => panic!("unexpected command parsed: {command:?}"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "mempalace-rs",
+            "tool",
+            "kg_query",
+            "--entity",
+            "Riley",
+            "--direction",
+            "incoming",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Tool {
+                command:
+                    ToolCommand::KgQuery {
+                        entity,
+                        as_of,
+                        direction,
+                    },
+            } => {
+                assert_eq!(entity, "Riley");
+                assert_eq!(as_of, None);
+                assert_eq!(direction, "incoming");
+            }
+            command => panic!("unexpected command parsed: {command:?}"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "mempalace-rs",
+            "tool",
+            "diary_read",
+            "--agent-name",
+            "codex",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Tool {
+                command: ToolCommand::DiaryRead { agent_name, last_n },
+            } => {
+                assert_eq!(agent_name, "codex");
+                assert_eq!(last_n, 10);
+            }
             command => panic!("unexpected command parsed: {command:?}"),
         }
     }

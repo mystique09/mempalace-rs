@@ -1,0 +1,198 @@
+name: Create GitHub Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "GitHub release tag to create, for example v0.1.0."
+        required: true
+        type: string
+      target:
+        description: "Branch, tag, or SHA to release."
+        required: true
+        default: main
+        type: string
+      draft:
+        description: "Create the GitHub release as a draft."
+        required: true
+        default: false
+        type: boolean
+      prerelease:
+        description: "Mark the GitHub release as a prerelease."
+        required: true
+        default: false
+        type: boolean
+
+jobs:
+  build-linux-release:
+    runs-on: ubicloud-standard-2
+    container:
+      image: rust:1-bookworm
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    env:
+      LINUX_TARGET: x86_64-unknown-linux-gnu
+    steps:
+      - name: Checkout release target
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.target }}
+
+      - name: Show Debian Rust build environment
+        run: |
+          cat /etc/debian_version
+          rustc --version
+          cargo --version
+
+      - name: Install build tools
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends protobuf-compiler
+
+      - name: Add Linux GNU target
+        run: rustup target add "${LINUX_TARGET}"
+
+      - name: Cache cargo dependencies
+        uses: ubicloud/cache@v4
+        with:
+          path: |
+            /usr/local/cargo/registry
+            /usr/local/cargo/git
+          key: ${{ runner.os }}-debian-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-debian-cargo-
+
+      - name: Build Debian Linux release binaries
+        run: |
+          cargo build --release --locked --timings \
+            --package mempalace-rs \
+            --package mempalace-mcp-bin \
+            --target "${LINUX_TARGET}"
+
+      - name: Package Debian Linux artifact
+        env:
+          RELEASE_TAG: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+
+          safe_tag="${RELEASE_TAG//\//-}"
+          package_name="mempalace-rs-${safe_tag}-${LINUX_TARGET}"
+          staging_dir="dist/${package_name}"
+
+          mkdir -p "${staging_dir}"
+          cp "target/${LINUX_TARGET}/release/mempalace-rs" "${staging_dir}/mempalace-rs"
+          cp "target/${LINUX_TARGET}/release/mempalace-mcp" "${staging_dir}/mempalace-mcp"
+          chmod +x "${staging_dir}/mempalace-rs" "${staging_dir}/mempalace-mcp"
+          cp README.md "${staging_dir}/README.md"
+
+          tar -C dist -czf "dist/${package_name}.tar.gz" "${package_name}"
+          (cd dist && sha256sum "${package_name}.tar.gz" > "${package_name}.tar.gz.sha256")
+
+      - name: Upload Debian Linux artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mempalace-linux-release
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  create-release:
+    runs-on: ubicloud-standard-2
+    needs: build-linux-release
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout release target
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.target }}
+          fetch-depth: 0
+
+      - name: Validate release tag
+        env:
+          RELEASE_TAG: ${{ inputs.version }}
+        run: |
+          if [ -z "${RELEASE_TAG}" ]; then
+            echo "Release tag is required."
+            exit 1
+          fi
+
+          if ! git check-ref-format --allow-onelevel "${RELEASE_TAG}"; then
+            echo "Release tag is not a valid git ref: ${RELEASE_TAG}"
+            exit 1
+          fi
+
+          if git rev-parse -q --verify "refs/tags/${RELEASE_TAG}" >/dev/null; then
+            echo "Release tag already exists: ${RELEASE_TAG}"
+            exit 1
+          fi
+
+      - name: Resolve target commit
+        id: target
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Generate GitHub release notes
+        uses: orhun/git-cliff-action@v4
+        with:
+          config: cliff.toml
+          args: --unreleased --tag "${{ inputs.version }}" --strip header --output RELEASE_NOTES.md --verbose
+
+      - name: Download Debian Linux artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: mempalace-linux-release
+          path: release-assets
+
+      - name: Create GitHub release
+        uses: actions/github-script@v7
+        env:
+          RELEASE_TAG: ${{ inputs.version }}
+          RELEASE_TARGET_SHA: ${{ steps.target.outputs.sha }}
+          RELEASE_DRAFT: ${{ inputs.draft }}
+          RELEASE_PRERELEASE: ${{ inputs.prerelease }}
+        with:
+          script: |
+            const fs = require("fs");
+            const path = require("path");
+            const tag = process.env.RELEASE_TAG.trim();
+            const target = process.env.RELEASE_TARGET_SHA;
+            const body = fs.readFileSync("RELEASE_NOTES.md", "utf8");
+            const draft = process.env.RELEASE_DRAFT === "true";
+            const prerelease = process.env.RELEASE_PRERELEASE === "true";
+            const { owner, repo } = context.repo;
+
+            const release = await github.rest.repos.createRelease({
+              owner,
+              repo,
+              tag_name: tag,
+              target_commitish: target,
+              name: tag,
+              body,
+              draft,
+              prerelease,
+            });
+
+            for (const assetName of fs.readdirSync("release-assets")) {
+              const assetPath = path.join("release-assets", assetName);
+              const stat = fs.statSync(assetPath);
+              if (!stat.isFile()) {
+                continue;
+              }
+
+              await github.rest.repos.uploadReleaseAsset({
+                owner,
+                repo,
+                release_id: release.data.id,
+                name: assetName,
+                data: fs.readFileSync(assetPath),
+                headers: {
+                  "content-type": assetName.endsWith(".sha256") ? "text/plain" : "application/gzip",
+                  "content-length": stat.size,
+                },
+              });
+            }

@@ -718,8 +718,10 @@ impl MemoryStore for LanceMemoryStore {
 }
 
 fn configure_onnxruntime_dylib_path() {
-    if env::var_os("ORT_DYLIB_PATH").is_some() {
-        return;
+    if let Some(existing_path) = env::var_os("ORT_DYLIB_PATH") {
+        if PathBuf::from(existing_path).is_file() {
+            return;
+        }
     }
 
     for candidate in onnxruntime_candidates() {
@@ -1052,13 +1054,41 @@ fn stable_hash(value: &str) -> usize {
 
 #[cfg(test)]
 mod tests {
+    use std::{env, ffi::OsString, path::PathBuf};
+
     use tempfile::tempdir;
 
     use super::{
         Drawer, DrawerMetadata, EMBEDDING_BATCH_SIZE, HYBRID_SCORE_COLUMN, LanceMemoryStore,
-        MemoryStore, SearchHit, SearchQuery, embedding_batches, identifier_tokens,
-        identifier_variants, onnxruntime_candidates, rerank_search_hits,
+        MemoryStore, SearchHit, SearchQuery, configure_onnxruntime_dylib_path, embedding_batches,
+        identifier_tokens, identifier_variants, onnxruntime_candidates, rerank_search_hits,
     };
+
+    struct EnvVarRestore {
+        key: &'static str,
+        original: Option<OsString>,
+    }
+
+    impl EnvVarRestore {
+        fn set(key: &'static str, value: &str) -> Self {
+            let original = env::var_os(key);
+            unsafe {
+                env::set_var(key, value);
+            }
+            Self { key, original }
+        }
+    }
+
+    impl Drop for EnvVarRestore {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.original {
+                    Some(value) => env::set_var(self.key, value),
+                    None => env::remove_var(self.key),
+                }
+            }
+        }
+    }
 
     fn drawer(id: &str, content: &str, wing: &str, room: &str) -> Drawer {
         Drawer {
@@ -1324,6 +1354,20 @@ mod tests {
                 .iter()
                 .any(|path| path.ends_with(".mempalace-bin\\onnxruntime.dll"))
         );
+    }
+
+    #[test]
+    fn configure_onnxruntime_path_replaces_invalid_existing_env_path() {
+        let stale_path = r".cortana\.cortana-bin\onnxruntime.dll";
+        let _restore = EnvVarRestore::set("ORT_DYLIB_PATH", stale_path);
+
+        configure_onnxruntime_dylib_path();
+
+        let configured = env::var_os("ORT_DYLIB_PATH")
+            .map(PathBuf::from)
+            .expect("ORT_DYLIB_PATH should be configured");
+        assert_ne!(configured, PathBuf::from(stale_path));
+        assert!(configured.is_file());
     }
 
     #[test]

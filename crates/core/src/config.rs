@@ -126,6 +126,10 @@ impl MempalaceConfig {
         self.config_dir.join(DEFAULT_KG_FILENAME)
     }
 
+    pub fn knowledge_graph_path_for_palace(palace_path: impl AsRef<Path>) -> PathBuf {
+        palace_path.as_ref().join(DEFAULT_KG_FILENAME)
+    }
+
     pub fn aaak_entities_path(&self) -> PathBuf {
         self.config_dir.join("aaak_entities.md")
     }
@@ -210,7 +214,7 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use super::MempalaceConfig;
+    use super::{DEFAULT_KG_FILENAME, MempalaceConfig};
 
     #[test]
     fn init_writes_default_config() {
@@ -295,6 +299,17 @@ mod tests {
         let config = MempalaceConfig::load_with_dir(&config_dir).unwrap();
 
         assert_eq!(config.fastembed_cache_path(), config_dir.join("fastembed"));
+    }
+
+    #[test]
+    fn knowledge_graph_path_for_palace_override_lives_under_palace_root() {
+        let tmp = tempdir().unwrap();
+        let palace_path = tmp.path().join("alternate-palace");
+
+        assert_eq!(
+            MempalaceConfig::knowledge_graph_path_for_palace(&palace_path),
+            palace_path.join(DEFAULT_KG_FILENAME)
+        );
     }
 
     #[test]

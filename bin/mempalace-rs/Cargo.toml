@@ -6,10 +6,10 @@ edition.workspace = true
 [[bin]]
 name = "mempalace-rs"
 path = "src/main.rs"
-test = false
 
 [dependencies]
 clap.workspace = true
+mempalace-mcp = { path = "../../crates/mcp" }
 mempalace-core = { path = "../../crates/core" }
 mempalace-store = { path = "../../crates/store" }
 serde.workspace = true
