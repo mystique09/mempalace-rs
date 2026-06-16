@@ -3589,6 +3589,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "mempalace-core",
+ "mempalace-mcp",
  "mempalace-store",
  "serde",
  "serde_json",

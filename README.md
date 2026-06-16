@@ -3,6 +3,7 @@
 `mempalace-rs` is the Rust workspace for MemPalace. It currently provides:
 
 - a CLI for initialization, project mining, semantic search, status inspection, and AAAK compression
+- a CLI `tool` namespace that mirrors the Rust MCP tool surface for skill and agent fallback
 - a LanceDB-backed drawer store with FastEmbed embeddings
 - a SQLite knowledge graph for temporal facts
 - a stdio MCP server that exposes the MemPalace tool surface
@@ -11,8 +12,8 @@ This repository is not yet a full Rust replacement for the Python package. The c
 
 ## Status
 
-- Implemented in Rust today: `init`, `status`, `mine`, `search`, `compress`, the LanceDB store, the knowledge graph library, and the MCP server.
-- Not exposed through the Rust CLI yet: direct knowledge-graph subcommands and some Python-only workflows from the reference package.
+- Implemented in Rust today: `init`, `status`, `mine`, `search`, `compress`, the `tool <MCP_TOOL>` CLI namespace, the LanceDB store, the knowledge graph library, and the MCP server.
+- Still missing from Rust parity: some Python-only workflows from the reference package.
 - Runtime bootstrapping is currently Windows-oriented because the embedding setup looks for `onnxruntime.dll`.
 
 ## Workspace Layout
@@ -76,6 +77,12 @@ Preview AAAK compression output:
 cargo run --bin mempalace-rs -- compress --wing mempalace-rs --dry-run
 ```
 
+Call an MCP-style tool through the CLI:
+
+```bash
+cargo run --bin mempalace-rs -- tool list_wings
+```
+
 Run the MCP server over stdio:
 
 ```bash
@@ -91,6 +98,7 @@ cargo run --bin mempalace-mcp
 | `search <QUERY> [SCOPE]` | Runs semantic search with optional wing or room filters; when no explicit wing is supplied, the CLI can infer one from `SCOPE` or the current project root |
 | `mine <DIR>` | Scans text-like project files, skips common binary/media/archive formats, chunks them into drawers, and writes them into a wing |
 | `compress` | Reads stored drawers and emits lossy AAAK summaries, either to stdout (`--dry-run`) or to a generated output file |
+| `tool <MCP_TOOL>` | Exposes the Rust MCP tool surface through the CLI and prints MCP-style JSON for automation, skills, and agent fallback |
 
 Useful flags:
 
@@ -99,6 +107,7 @@ Useful flags:
 - `mine --exclude-data-files` skips noisy `.json`, `.csv`, and `.sql` files in data-heavy folders when you want a cleaner index than the Python default.
 - `mine --no-gitignore` disables `.gitignore`-aware scanning.
 - `search --all-wings` disables implicit wing narrowing.
+- `tool --help` lists the mirrored tool names, and `tool <name> --help` shows the tool-specific flags.
 
 ## Onboarding And Generated Files
 
@@ -151,6 +160,8 @@ The Rust MCP server is implemented in [`crates/mcp`](crates/mcp/src/lib.rs) and 
 - knowledge-graph tools such as `mempalace_kg_query`, `mempalace_kg_add`, and `mempalace_kg_invalidate`
 - navigation tools such as `mempalace_traverse` and `mempalace_find_tunnels`
 - diary tools such as `mempalace_diary_write` and `mempalace_diary_read`
+
+The same Rust implementation is also available through the CLI as `mempalace-rs tool <tool_name>`, which prints MCP-style JSON and is intended as a fallback path for environments that can invoke CLI commands but not MCP.
 
 `mempalace_status` also returns the embedded memory protocol and AAAK dialect guidance so an MCP client can learn the expected usage pattern on connect.
 

@@ -161,10 +161,16 @@ pub struct McpServer {
 
 impl McpServer {
     pub async fn open() -> Result<Self, Box<dyn std::error::Error>> {
+        Self::open_with_palace(None).await
+    }
+
+    pub async fn open_with_palace(
+        palace_override: Option<PathBuf>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let config = MempalaceConfig::load()?;
         config.init()?;
 
-        let palace_root = config.palace_path();
+        let palace_root = palace_override.unwrap_or_else(|| config.palace_path());
         let store_path = MempalaceConfig::resolve_store_path(&palace_root);
         let fastembed_cache_path = config.fastembed_cache_path();
         let onnxruntime_dylib_path = config.onnxruntime_dylib_path();
@@ -195,7 +201,7 @@ impl McpServer {
         Ok(())
     }
 
-    async fn tool_status(&self) -> Result<Value, String> {
+    pub async fn tool_status(&self) -> Result<Value, String> {
         let status = self
             .app
             .store
@@ -226,7 +232,7 @@ impl McpServer {
         }))
     }
 
-    async fn tool_list_wings(&self) -> Result<Value, String> {
+    pub async fn tool_list_wings(&self) -> Result<Value, String> {
         let room_counts = self
             .app
             .store
@@ -240,7 +246,7 @@ impl McpServer {
         Ok(json!({ "wings": wings }))
     }
 
-    async fn tool_list_rooms(&self, wing: Option<String>) -> Result<Value, String> {
+    pub async fn tool_list_rooms(&self, wing: Option<String>) -> Result<Value, String> {
         let room_counts = self
             .app
             .store
@@ -256,7 +262,7 @@ impl McpServer {
         Ok(json!({ "wing": wing.unwrap_or_else(|| "all".to_owned()), "rooms": rooms }))
     }
 
-    async fn tool_get_taxonomy(&self) -> Result<Value, String> {
+    pub async fn tool_get_taxonomy(&self) -> Result<Value, String> {
         let room_counts = self
             .app
             .store
@@ -273,7 +279,11 @@ impl McpServer {
         Ok(json!({ "taxonomy": taxonomy }))
     }
 
-    async fn tool_search(
+    pub fn tool_get_aaak_spec(&self) -> Value {
+        json!({ "aaak_spec": AAAK_SPEC })
+    }
+
+    pub async fn tool_search(
         &self,
         query: String,
         limit: usize,
@@ -311,7 +321,11 @@ impl McpServer {
         }))
     }
 
-    async fn tool_check_duplicate(&self, content: String, threshold: f32) -> Result<Value, String> {
+    pub async fn tool_check_duplicate(
+        &self,
+        content: String,
+        threshold: f32,
+    ) -> Result<Value, String> {
         let mut query = SearchQuery::new(content.clone());
         query.limit = 5;
         let hits = self
@@ -341,7 +355,7 @@ impl McpServer {
         }))
     }
 
-    async fn tool_add_drawer(
+    pub async fn tool_add_drawer(
         &self,
         wing: String,
         room: String,
@@ -389,7 +403,7 @@ impl McpServer {
         }))
     }
 
-    async fn tool_delete_drawer(&self, drawer_id: String) -> Result<Value, String> {
+    pub async fn tool_delete_drawer(&self, drawer_id: String) -> Result<Value, String> {
         let deleted = self
             .app
             .store
@@ -404,7 +418,7 @@ impl McpServer {
         }
     }
 
-    async fn tool_kg_query(
+    pub async fn tool_kg_query(
         &self,
         entity: String,
         as_of: Option<String>,
@@ -425,7 +439,7 @@ impl McpServer {
         }))
     }
 
-    async fn tool_kg_add(
+    pub async fn tool_kg_add(
         &self,
         subject: String,
         predicate: String,
@@ -455,7 +469,7 @@ impl McpServer {
         }))
     }
 
-    async fn tool_kg_invalidate(
+    pub async fn tool_kg_invalidate(
         &self,
         subject: String,
         predicate: String,
@@ -473,7 +487,7 @@ impl McpServer {
         }))
     }
 
-    async fn tool_kg_timeline(&self, entity: Option<String>) -> Result<Value, String> {
+    pub async fn tool_kg_timeline(&self, entity: Option<String>) -> Result<Value, String> {
         let timeline = self
             .app
             .graph
@@ -487,12 +501,12 @@ impl McpServer {
         }))
     }
 
-    async fn tool_kg_stats(&self) -> Result<Value, String> {
+    pub async fn tool_kg_stats(&self) -> Result<Value, String> {
         let stats = self.app.graph.stats().map_err(|error| error.to_string())?;
         serde_json::to_value(stats).map_err(|error| error.to_string())
     }
 
-    async fn tool_diary_write(
+    pub async fn tool_diary_write(
         &self,
         agent_name: String,
         entry: String,
@@ -528,7 +542,11 @@ impl McpServer {
         }))
     }
 
-    async fn tool_diary_read(&self, agent_name: String, last_n: usize) -> Result<Value, String> {
+    pub async fn tool_diary_read(
+        &self,
+        agent_name: String,
+        last_n: usize,
+    ) -> Result<Value, String> {
         let wing = format!("wing_{}", slugify(&agent_name));
         let mut drawers = self
             .app
@@ -562,7 +580,11 @@ impl McpServer {
         }))
     }
 
-    async fn tool_traverse(&self, start_room: String, max_hops: usize) -> Result<Value, String> {
+    pub async fn tool_traverse(
+        &self,
+        start_room: String,
+        max_hops: usize,
+    ) -> Result<Value, String> {
         let (nodes, _) = self.build_graph().await?;
         let Some(start) = nodes.get(&start_room) else {
             return Ok(json!({
@@ -626,7 +648,7 @@ impl McpServer {
         Ok(json!(results))
     }
 
-    async fn tool_find_tunnels(
+    pub async fn tool_find_tunnels(
         &self,
         wing_a: Option<String>,
         wing_b: Option<String>,
@@ -667,7 +689,7 @@ impl McpServer {
         Ok(json!(tunnels))
     }
 
-    async fn tool_graph_stats(&self) -> Result<Value, String> {
+    pub async fn tool_graph_stats(&self) -> Result<Value, String> {
         let (nodes, total_edges) = self.build_graph().await?;
         let tunnel_rooms = nodes.values().filter(|data| data.wings.len() >= 2).count();
         let mut rooms_per_wing = BTreeMap::<String, usize>::new();
@@ -778,7 +800,7 @@ impl McpServer {
         description = "Get the AAAK dialect specification - the compressed memory format MemPalace uses."
     )]
     async fn mempalace_get_aaak_spec(&self) -> McpResult {
-        Ok(Json(json!({ "aaak_spec": AAAK_SPEC })))
+        Ok(Json(self.tool_get_aaak_spec()))
     }
 
     #[tool(
@@ -1077,7 +1099,7 @@ fn bundled_onnxruntime_candidates() -> Vec<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::{GraphNode, diary_topic, excerpt, fuzzy_match, slugify};
+    use super::{GraphNode, McpServer, diary_topic, excerpt, fuzzy_match, slugify};
     use std::collections::{BTreeMap, BTreeSet};
 
     #[test]
@@ -1107,5 +1129,39 @@ mod tests {
     fn helper_functions_trim_diary_and_excerpt() {
         assert_eq!(diary_topic("diary/general"), Some("general"));
         assert!(excerpt("a b c d e f", 3).ends_with("..."));
+    }
+
+    #[test]
+    fn exported_tool_names_keep_mempalace_prefix() {
+        let tools = McpServer::tool_router().list_all();
+        let names = tools
+            .iter()
+            .map(|tool| tool.name.as_ref())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            names,
+            vec![
+                "mempalace_add_drawer",
+                "mempalace_check_duplicate",
+                "mempalace_delete_drawer",
+                "mempalace_diary_read",
+                "mempalace_diary_write",
+                "mempalace_find_tunnels",
+                "mempalace_get_aaak_spec",
+                "mempalace_get_taxonomy",
+                "mempalace_graph_stats",
+                "mempalace_kg_add",
+                "mempalace_kg_invalidate",
+                "mempalace_kg_query",
+                "mempalace_kg_stats",
+                "mempalace_kg_timeline",
+                "mempalace_list_rooms",
+                "mempalace_list_wings",
+                "mempalace_search",
+                "mempalace_status",
+                "mempalace_traverse",
+            ]
+        );
     }
 }
