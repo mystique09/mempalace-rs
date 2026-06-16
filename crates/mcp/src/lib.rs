@@ -170,6 +170,10 @@ impl McpServer {
         let config = MempalaceConfig::load()?;
         config.init()?;
 
+        let knowledge_graph_path = palace_override
+            .as_deref()
+            .map(MempalaceConfig::knowledge_graph_path_for_palace)
+            .unwrap_or_else(|| config.knowledge_graph_path());
         let palace_root = palace_override.unwrap_or_else(|| config.palace_path());
         let store_path = MempalaceConfig::resolve_store_path(&palace_root);
         let fastembed_cache_path = config.fastembed_cache_path();
@@ -182,7 +186,7 @@ impl McpServer {
 
         let store =
             LanceMemoryStore::new(&store_path, config.collection_name(), &fastembed_cache_path)?;
-        let graph = KnowledgeGraph::new(config.knowledge_graph_path())?;
+        let graph = KnowledgeGraph::new(knowledge_graph_path)?;
 
         Ok(Self {
             app: AppContext {
