@@ -1,0 +1,95 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  fmt:
+    name: cargo fmt
+    runs-on: ubicloud-standard-2
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          components: rustfmt
+
+      - name: Run sccache-cache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+  clippy:
+    name: cargo clippy
+    runs-on: ubicloud-standard-2
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          components: clippy
+
+      - name: Run sccache-cache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends protobuf-compiler
+
+      - name: Cache cargo dependencies
+        uses: ubicloud/cache@v4
+        with:
+          path: ~/.cargo
+          key: ${{ runner.os }}-clippy-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-clippy-cargo-
+            ${{ runner.os }}-cargo-
+
+      - name: Run clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+        env:
+          RUSTC_WRAPPER: "sccache"
+
+  test:
+    name: cargo test
+    runs-on: ubicloud-standard-2
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Run sccache-cache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends protobuf-compiler
+
+      - name: Cache cargo dependencies
+        uses: ubicloud/cache@v4
+        with:
+          path: ~/.cargo
+          key: ${{ runner.os }}-test-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-test-cargo-
+            ${{ runner.os }}-cargo-
+
+      - name: Run tests
+        run: cargo test --workspace
+        env:
+          RUSTC_WRAPPER: "sccache"
