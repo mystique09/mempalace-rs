@@ -856,9 +856,9 @@ fn ask_mode() -> Result<String, Box<dyn std::error::Error>> {
     }
 }
 
-fn ask_people(
-    mode: &str,
-) -> Result<(Vec<OnboardingPerson>, BTreeMap<String, String>), Box<dyn std::error::Error>> {
+type PeopleResult = (Vec<OnboardingPerson>, BTreeMap<String, String>);
+
+fn ask_people(mode: &str) -> Result<PeopleResult, Box<dyn std::error::Error>> {
     let mut people = Vec::new();
     let mut aliases = BTreeMap::new();
 
@@ -1315,7 +1315,8 @@ fn write_entity_registry(
 
     let ambiguous_flags = registry_people
         .keys()
-        .filter_map(|name| is_ambiguous_registry_name(name).then(|| name.to_lowercase()))
+        .filter(|&name| is_ambiguous_registry_name(name))
+        .map(|name| name.to_lowercase())
         .collect::<Vec<_>>();
 
     let raw = serde_json::to_string_pretty(&EntityRegistryFile {
@@ -1533,9 +1534,9 @@ fn preferred_project_config_path(project_dir: &Path) -> PathBuf {
     project_dir.join("mempalace.yml")
 }
 
-fn detect_init_rooms(
-    project_dir: &Path,
-) -> Result<Vec<(String, String, Vec<String>)>, Box<dyn std::error::Error>> {
+type InitRooms = Vec<(String, String, Vec<String>)>;
+
+fn detect_init_rooms(project_dir: &Path) -> Result<InitRooms, Box<dyn std::error::Error>> {
     let mut rooms = Vec::new();
 
     for entry in fs::read_dir(project_dir)? {
@@ -1602,10 +1603,7 @@ fn should_skip_init_dir(path: &Path) -> bool {
 }
 
 fn normalize_init_name(name: &str) -> String {
-    name.trim()
-        .replace('-', "_")
-        .replace(' ', "_")
-        .to_lowercase()
+    name.trim().replace(['-', ' '], "_").to_lowercase()
 }
 
 fn render_project_config(wing: &str, rooms: &[(String, String, Vec<String>)]) -> String {

@@ -334,11 +334,11 @@ impl AaakDialect {
                 decoded.tunnels.push(line.to_owned());
                 continue;
             }
-            if let Some((left, _, _)) = split_once3(line, '|') {
-                if left.contains(':') {
-                    decoded.entries.push(line.to_owned());
-                    continue;
-                }
+            if let Some((left, _, _)) = split_once3(line, '|')
+                && left.contains(':')
+            {
+                decoded.entries.push(line.to_owned());
+                continue;
             }
             let parts = line.split('|').collect::<Vec<_>>();
             if parts.len() >= 2 {
@@ -521,7 +521,7 @@ impl AaakDialect {
                     (score, quote)
                 })
                 .collect::<Vec<_>>();
-            scored.sort_by(|a, b| b.0.cmp(&a.0));
+            scored.sort_by_key(|b| std::cmp::Reverse(b.0));
             if let Some((_, quote)) = scored.into_iter().next() {
                 return quote;
             }
@@ -1142,12 +1142,12 @@ fn extract_single_quoted_fragments(text: &str) -> Vec<String> {
             continue;
         }
 
-        if let Some(start_index) = start.take() {
-            if boundary_after {
-                let fragment = text[start_index..*index].trim();
-                if (8..=55).contains(&fragment.chars().count()) {
-                    fragments.push(fragment.to_owned());
-                }
+        if let Some(start_index) = start.take()
+            && boundary_after
+        {
+            let fragment = text[start_index..*index].trim();
+            if (8..=55).contains(&fragment.chars().count()) {
+                fragments.push(fragment.to_owned());
             }
         }
     }

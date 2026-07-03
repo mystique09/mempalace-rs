@@ -93,6 +93,7 @@ impl KnowledgeGraph {
         Ok(entity_id)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn add_triple(
         &self,
         subject: &str,

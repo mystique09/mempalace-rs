@@ -80,7 +80,7 @@ impl LanceMemoryStore {
             table_name: table_name.into(),
             embedder: Arc::new(EmbeddingBackend::Model2Vec {
                 dim,
-                inner: Mutex::new(Some(model)),
+                inner: Box::new(Mutex::new(Some(model))),
             }),
             connection: Arc::new(Mutex::new(None)),
             table: Arc::new(Mutex::new(None)),
@@ -749,7 +749,7 @@ impl MemoryStore for LanceMemoryStore {
 enum EmbeddingBackend {
     Model2Vec {
         dim: usize,
-        inner: Mutex<Option<StaticModel>>,
+        inner: Box<Mutex<Option<StaticModel>>>,
     },
     #[cfg(test)]
     Deterministic { dim: usize },
