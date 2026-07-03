@@ -2190,8 +2190,6 @@ dependencies = [
  "allocator-api2",
  "equivalent",
  "foldhash 0.2.0",
- "serde",
- "serde_core",
 ]
 
 [[package]]
@@ -6381,10 +6379,12 @@ dependencies = [
  "bytes",
  "either",
  "getrandom 0.3.4",
+ "half",
  "hashbrown 0.15.5",
  "hashbrown 0.16.1",
  "indexmap 2.13.1",
  "memchr",
+ "num-traits",
  "once_cell",
  "petgraph",
  "prost",
@@ -6399,7 +6399,6 @@ dependencies = [
  "syn 2.0.117",
  "tokio",
  "tokio-util",
- "zerocopy",
 ]
 
 [[package]]
