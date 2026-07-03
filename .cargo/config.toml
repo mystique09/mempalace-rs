@@ -1,6 +1,19 @@
-# Fix ring/cc crate deployment target when xcrun reports an SDK version
-# that doesn't have a valid TargetConditionals.h for that deployment target.
-# xcrun --show-sdk-version can be ahead of the actual OS, causing:
-#   fatal error: 'TargetConditionals.h' file not found
+# Fix ring/cc crate when xcrun reports SDK 26.5 but the
+# compiler can't find system headers (TargetConditionals.h).
+#
+# Root cause: cc-rs 1.2.65 only adds -isysroot for macOS when
+# is_xctoolchain_clang() is true (path contains ".xctoolchain/").
+# Command Line Tools cc at /usr/bin/cc does NOT match, so -isysroot
+# is never added even when SDKROOT is set. The compiler can't find
+# system headers without -isysroot on this SDK version.
+#
+# Fix: set CFLAGS with -isysroot explicitly, which cc-rs always
+# passes through to the compiler regardless of toolchain detection.
+# Also set MACOSX_DEPLOYMENT_TARGET to match the actual OS (26.4),
+# not the SDK version (26.5).
+#
+# To find your SDK path: xcrun --show-sdk-path
 [env]
 MACOSX_DEPLOYMENT_TARGET = "26.4"
+CFLAGS = "-isysroot /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk"
+CXXFLAGS = "-isysroot /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk"
