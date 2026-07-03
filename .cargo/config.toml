@@ -1,0 +1,6 @@
+# Fix ring/cc crate deployment target when xcrun reports an SDK version
+# that doesn't have a valid TargetConditionals.h for that deployment target.
+# xcrun --show-sdk-version can be ahead of the actual OS, causing:
+#   fatal error: 'TargetConditionals.h' file not found
+[env]
+MACOSX_DEPLOYMENT_TARGET = "26.4"
