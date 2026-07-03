@@ -402,9 +402,8 @@ impl MemoryStore for SqliteMemoryStore {
                     .collect();
 
                 if knn_results.is_empty() {
-                    return Ok(Vec::new());
-                }
-
+                    // KNN returned empty — fall through to brute-force path below
+                } else {
                 // Build rowid list for fetching full rows
                 let rowid_list: Vec<String> = knn_results.iter().map(|(r, _)| r.to_string()).collect();
                 let rowid_placeholders = rowid_list.join(",");
@@ -492,6 +491,7 @@ impl MemoryStore for SqliteMemoryStore {
                 hits.truncate(query.limit);
 
                 return Ok(hits);
+                } // end vectorlite block
             }
 
             // --- Brute-force fallback ---
