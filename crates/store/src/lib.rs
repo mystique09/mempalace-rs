@@ -15,6 +15,26 @@ use mempalace_core::{
 };
 
 const DEFAULT_MODEL_REPO: &str = "minishlab/potion-base-32M";
+const _EMBEDDING_DIM: usize = 384; // potion-base-32M output dimensionality
+
+/// DDL for the vectorlite HNSW virtual table — created only when the extension loads.
+const VECTORLITE_TABLE_DDL: &str = "
+CREATE VIRTUAL TABLE IF NOT EXISTS drawers_vec USING vectorlite(
+    embedding float32[384] cosine,
+    hnsw(max_elements=100000)
+);
+";
+
+/// Triggers to keep the vectorlite table in sync with the drawers table.
+const VECTORLITE_TRIGGER_DDL: &str = "
+CREATE TRIGGER IF NOT EXISTS drawers_vec_ai AFTER INSERT ON drawers BEGIN
+    INSERT INTO drawers_vec(rowid, embedding) VALUES (new.rowid, new.embedding);
+END;
+
+CREATE TRIGGER IF NOT EXISTS drawers_vec_ad AFTER DELETE ON drawers BEGIN
+    DELETE FROM drawers_vec WHERE rowid = old.rowid;
+END;
+";
 
 /// Schema DDL for the SQLite store.
 const SCHEMA_DDL: &str = "
@@ -45,12 +65,53 @@ CREATE TRIGGER IF NOT EXISTS drawers_ad AFTER DELETE ON drawers BEGIN
 END;
 ";
 
+fn try_load_vectorlite(conn: &Connection) -> bool {
+    let lib_name = if cfg!(target_os = "macos") {
+        "vectorlite.dylib"
+    } else if cfg!(target_os = "linux") {
+        "vectorlite.so"
+    } else if cfg!(target_os = "windows") {
+        "vectorlite.dll"
+    } else {
+        return false;
+    };
+
+    let mut search_paths: Vec<PathBuf> = vec![
+        std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.join(lib_name)))
+            .unwrap_or_default(),
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join(".mempalace-bin")
+            .join(lib_name),
+    ];
+
+    // Also try the build.rs output path (embedded at compile time)
+    if let Some(build_path) = option_env!("VECTORLITE_LIB_PATH") {
+        search_paths.push(PathBuf::from(build_path));
+    }
+
+    search_paths.push(PathBuf::from(lib_name));
+
+    for path in &search_paths {
+        if path.exists()
+            && unsafe { conn.load_extension_enable().is_ok() }
+            && unsafe { conn.load_extension(path, None::<&str>).is_ok() }
+        {
+            return true;
+        }
+    }
+
+    false
+}
+
 #[derive(Clone)]
 pub struct SqliteMemoryStore {
     #[allow(dead_code)]
     palace_path: PathBuf,
     embedder: Arc<EmbeddingBackend>,
     conn: Arc<Mutex<Connection>>,
+    vectorlite_available: bool,
 }
 
 impl SqliteMemoryStore {
@@ -82,12 +143,21 @@ impl SqliteMemoryStore {
         // Create schema
         conn.execute_batch(SCHEMA_DDL)?;
 
+        // Try to load the vectorlite HNSW extension
+        let vectorlite_available = try_load_vectorlite(&conn);
+        if vectorlite_available {
+            // Create vectorlite virtual table and sync triggers
+            let _ = conn.execute_batch(VECTORLITE_TABLE_DDL);
+            let _ = conn.execute_batch(VECTORLITE_TRIGGER_DDL);
+        }
+
         Ok(Self {
             palace_path,
             embedder: Arc::new(EmbeddingBackend::Model2Vec {
                 inner: Box::new(Mutex::new(Some(model))),
             }),
             conn: Arc::new(Mutex::new(conn)),
+            vectorlite_available,
         })
     }
 
@@ -99,10 +169,18 @@ impl SqliteMemoryStore {
         let conn = Connection::open(&db_path).unwrap();
         conn.execute_batch(SCHEMA_DDL).unwrap();
 
+        // Try loading vectorlite in tests too, but tests work fine without it
+        let vectorlite_available = try_load_vectorlite(&conn);
+        if vectorlite_available {
+            let _ = conn.execute_batch(VECTORLITE_TABLE_DDL);
+            let _ = conn.execute_batch(VECTORLITE_TRIGGER_DDL);
+        }
+
         Self {
             palace_path,
-            embedder: Arc::new(EmbeddingBackend::Deterministic { dim: 64 }),
+            embedder: Arc::new(EmbeddingBackend::Deterministic { dim: 384 }),
             conn: Arc::new(Mutex::new(conn)),
+            vectorlite_available,
         }
     }
 
@@ -117,7 +195,7 @@ impl SqliteMemoryStore {
         f(&conn)
     }
 
-    fn search_filter(query: &SearchQuery) -> Option<String> {
+    fn search_condition(query: &SearchQuery) -> Option<String> {
         let mut parts = Vec::new();
         if let Some(wing) = &query.wing {
             parts.push(format!("wing = '{}'", sql_escape(wing)));
@@ -130,6 +208,12 @@ impl SqliteMemoryStore {
         } else {
             Some(parts.join(" AND "))
         }
+    }
+
+    fn search_filter_clause(query: &SearchQuery) -> String {
+        Self::search_condition(query)
+            .map(|c| format!("WHERE {c}"))
+            .unwrap_or_default()
     }
 
     fn supports_full_text_search(query: &str) -> bool {
@@ -284,29 +368,146 @@ impl MemoryStore for SqliteMemoryStore {
         let retrieval_limit = Self::retrieval_limit(query.limit);
         let query_vector = self.embedder.embed(&query.query)?;
         let use_fts = Self::supports_full_text_search(&query.query);
+        let vectorlite_available = self.vectorlite_available;
 
         self.with_conn(|conn| {
-            // Get all drawers (with optional wing/room filter)
-            let filter_clause = Self::search_filter(&query)
-                .map(|f| format!("WHERE {f}"))
+            let filter_where = Self::search_filter_clause(&query);
+            let filter_and = Self::search_condition(&query)
+                .map(|c| format!("AND {c}"))
                 .unwrap_or_default();
 
+            let mut rows: Vec<(Drawer, Vec<f32>)>;
+            let vector_hits: Vec<(usize, f32)>;
+
+            if vectorlite_available {
+                // --- HNSW ANN via vectorlite ---
+                let query_blob = vector_to_blob(&query_vector);
+
+                // Fetch more from ANN to allow for post-filter narrowing
+                let knn_limit = retrieval_limit.max(256) as i64;
+
+                let knn_sql = "SELECT rowid, distance FROM drawers_vec WHERE knn_search(embedding, knn_param(?1, ?2, ?3))";
+                let mut knn_stmt = conn.prepare(knn_sql)?;
+
+                let knn_results: Vec<(i64, f32)> = knn_stmt
+                    .query_map(
+                        params![query_blob, knn_limit, 50_i64],
+                        |row| {
+                            let rowid: i64 = row.get(0)?;
+                            let distance: f32 = row.get(1)?;
+                            Ok((rowid, distance))
+                        },
+                    )?
+                    .filter_map(|r| r.ok())
+                    .collect();
+
+                if knn_results.is_empty() {
+                    return Ok(Vec::new());
+                }
+
+                // Build rowid list for fetching full rows
+                let rowid_list: Vec<String> = knn_results.iter().map(|(r, _)| r.to_string()).collect();
+                let rowid_placeholders = rowid_list.join(",");
+
+                // Fetch drawer rows and map rowid -> index
+                let fetch_sql = format!(
+                    "SELECT rowid, id, content, wing, room, source_file, chunk_index, added_by, filed_at, embedding
+                     FROM drawers WHERE rowid IN ({rowid_placeholders}) {filter_and}"
+                );
+
+                let mut fetch_stmt = conn.prepare(&fetch_sql)?;
+
+                let mut rowid_to_idx: HashMap<i64, usize> = HashMap::new();
+                rows = Vec::with_capacity(knn_results.len());
+
+                let fetched: Vec<(i64, Drawer, Vec<f32>)> = fetch_stmt
+                    .query_map([], |row| {
+                        let rowid: i64 = row.get(0)?;
+                        let embedding: Vec<u8> = row.get(9)?;
+                        let floats = blob_to_vector(&embedding);
+                        Ok((rowid, row_to_drawer_offset(row, 1)?, floats))
+                    })?
+                    .filter_map(|r| r.ok())
+                    .collect();
+
+                for (idx, (rowid, drawer, emb)) in fetched.into_iter().enumerate() {
+                    rowid_to_idx.insert(rowid, idx);
+                    rows.push((drawer, emb));
+                }
+
+                if rows.is_empty() {
+                    return Ok(Vec::new());
+                }
+
+                // Convert cosine distances to scores (distance ∈ [0,2], score = 1 - d/2)
+                vector_hits = knn_results
+                    .iter()
+                    .filter_map(|(rowid, distance)| {
+                        rowid_to_idx.get(rowid).map(|&idx| {
+                            let score = 1.0 - distance / 2.0;
+                            (idx, score)
+                        })
+                    })
+                    .collect();
+
+                // FTS5 search with correct rowid mapping
+                let fts_hits: Vec<(usize, f32)> = if use_fts {
+                    let fts_sql =
+                        "SELECT rowid, rank FROM drawers_fts WHERE drawers_fts MATCH ?1 ORDER BY rank LIMIT ?2";
+                    let mut fts_stmt = conn.prepare(fts_sql)?;
+
+                    fts_stmt
+                        .query_map(
+                            params![query.query, retrieval_limit as i64],
+                            |row| {
+                                let rowid: i64 = row.get(0)?;
+                                let rank: f32 = row.get(1)?;
+                                Ok((rowid, rank))
+                            },
+                        )?
+                        .filter_map(|r| r.ok())
+                        .filter_map(|(rowid, rank)| {
+                            rowid_to_idx.get(&rowid).map(|&idx| (idx, rank))
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+
+                // RRF merge
+                let merged = reciprocal_rank_fusion(&vector_hits, &fts_hits, 60);
+                let mut sorted: Vec<(usize, f32)> = merged.into_iter().collect();
+                sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
+
+                let mut hits: Vec<SearchHit> = sorted
+                    .into_iter()
+                    .take(retrieval_limit)
+                    .map(|(idx, score)| SearchHit {
+                        drawer: rows[idx].0.clone(),
+                        score,
+                    })
+                    .collect();
+
+                rerank_search_hits(&mut hits, &query);
+                hits.truncate(query.limit);
+
+                return Ok(hits);
+            }
+
+            // --- Brute-force fallback ---
             let sql = format!(
                 "SELECT id, content, wing, room, source_file, chunk_index, added_by, filed_at, embedding
-                 FROM drawers {filter_clause}"
+                 FROM drawers {filter_where}"
             );
 
-            let mut stmt = conn
-                .prepare(&sql)
-                ?;
+            let mut stmt = conn.prepare(&sql)?;
 
-            let rows: Vec<(Drawer, Vec<f32>)> = stmt
+            rows = stmt
                 .query_map([], |row| {
                     let embedding: Vec<u8> = row.get(8)?;
                     let floats = blob_to_vector(&embedding);
                     Ok((row_to_drawer(row)?, floats))
-                })
-                ?
+                })?
                 .filter_map(|r| r.ok())
                 .collect();
 
@@ -314,18 +515,15 @@ impl MemoryStore for SqliteMemoryStore {
                 return Ok(Vec::new());
             }
 
-            // Compute cosine similarity scores
-            let vector_hits: Vec<(usize, f32)> = rows
+            vector_hits = rows
                 .iter()
                 .enumerate()
-                .map(|(idx, (_, emb))| {
-                    (idx, cosine_similarity(&query_vector, emb))
-                })
+                .map(|(idx, (_, emb))| (idx, cosine_similarity(&query_vector, emb)))
                 .collect();
 
-            // FTS5 search if applicable
             let fts_hits: Vec<(usize, f32)> = if use_fts {
-                let fts_sql = "SELECT rowid, rank FROM drawers_fts WHERE drawers_fts MATCH ?1 ORDER BY rank LIMIT ?2";
+                let fts_sql =
+                    "SELECT rowid, rank FROM drawers_fts WHERE drawers_fts MATCH ?1 ORDER BY rank LIMIT ?2";
                 let mut fts_stmt = conn.prepare(fts_sql)?;
 
                 let fts_results: Vec<(i64, f32)> = fts_stmt
@@ -336,17 +534,25 @@ impl MemoryStore for SqliteMemoryStore {
                             let rank: f32 = row.get(1)?;
                             Ok((rowid, rank))
                         },
-                    )
-                    ?
+                    )?
                     .filter_map(|r| r.ok())
                     .collect();
 
-                // Build a rowid -> index map
+                // Build rowid -> index map by querying rowids
                 let mut rowid_to_idx: HashMap<i64, usize> = HashMap::new();
-                for (idx, (_drawer, _)) in rows.iter().enumerate() {
-                    // We need the rowid from the drawer. Let's fetch it separately.
-                    // For now, use the drawer's position as a proxy.
-                    rowid_to_idx.insert(idx as i64 + 1, idx);
+                if !fts_results.is_empty() && !rows.is_empty() {
+                    // Query rowids for current rows
+                    let rowid_sql = "SELECT rowid FROM drawers";
+                    let mut rid_stmt = conn.prepare(rowid_sql)?;
+                    let all_rowids: Vec<i64> = rid_stmt
+                        .query_map([], |row| row.get(0))?
+                        .filter_map(|r| r.ok())
+                        .collect();
+                    for (idx, rowid) in all_rowids.iter().enumerate() {
+                        if idx < rows.len() {
+                            rowid_to_idx.insert(*rowid, idx);
+                        }
+                    }
                 }
 
                 fts_results
@@ -359,10 +565,7 @@ impl MemoryStore for SqliteMemoryStore {
                 Vec::new()
             };
 
-            // RRF merge
             let merged = reciprocal_rank_fusion(&vector_hits, &fts_hits, 60);
-
-            // Sort by RRF score descending, take top retrieval_limit
             let mut sorted: Vec<(usize, f32)> = merged.into_iter().collect();
             sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
 
@@ -375,7 +578,6 @@ impl MemoryStore for SqliteMemoryStore {
                 })
                 .collect();
 
-            // Rerank with content/file heuristics
             rerank_search_hits(&mut hits, &query);
             hits.truncate(query.limit);
 
@@ -586,16 +788,23 @@ fn reciprocal_rank_fusion(
 // --- Row mapping ---
 
 fn row_to_drawer(row: &rusqlite::Row<'_>) -> std::result::Result<Drawer, rusqlite::Error> {
+    row_to_drawer_offset(row, 0)
+}
+
+fn row_to_drawer_offset(
+    row: &rusqlite::Row<'_>,
+    offset: usize,
+) -> std::result::Result<Drawer, rusqlite::Error> {
     Ok(Drawer {
-        id: row.get(0)?,
-        content: row.get(1)?,
+        id: row.get(offset)?,
+        content: row.get(offset + 1)?,
         metadata: DrawerMetadata {
-            wing: row.get(2)?,
-            room: row.get(3)?,
-            source_file: row.get(4)?,
-            chunk_index: row.get(5)?,
-            added_by: row.get(6)?,
-            filed_at: row.get(7)?,
+            wing: row.get(offset + 2)?,
+            room: row.get(offset + 3)?,
+            source_file: row.get(offset + 4)?,
+            chunk_index: row.get(offset + 5)?,
+            added_by: row.get(offset + 6)?,
+            filed_at: row.get(offset + 7)?,
         },
     })
 }
