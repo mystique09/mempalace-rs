@@ -76,6 +76,12 @@ enum Command {
         #[arg(long)]
         no_gitignore: bool,
     },
+    Remine {
+        #[arg(long)]
+        wing: Option<String>,
+        #[arg(long)]
+        dry_run: bool,
+    },
     Tool {
         #[command(subcommand)]
         command: ToolCommand,
@@ -359,6 +365,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 },
             )
             .await?;
+        }
+        Command::Remine { wing, dry_run } => {
+            let app = open_context(cli.palace).await?;
+            run_remine(&app, wing, dry_run).await?;
         }
         Command::Tool { command } => {
             let server = McpServer::open_with_palace(cli.palace).await?;
@@ -683,15 +693,12 @@ async fn open_context(
         .unwrap_or_else(|| config.knowledge_graph_path());
     let palace_root = palace_override.unwrap_or_else(|| config.palace_path());
     let store_path = MempalaceConfig::resolve_store_path(&palace_root);
-    let fastembed_cache_path = config.fastembed_cache_path();
-    let onnxruntime_dylib_path = config.onnxruntime_dylib_path();
+    let model_cache_path = config.model_cache_path();
     fs::create_dir_all(&palace_root)?;
     fs::create_dir_all(&store_path)?;
-    fs::create_dir_all(&fastembed_cache_path)?;
-    seed_onnxruntime_dylib(&onnxruntime_dylib_path)?;
+    fs::create_dir_all(&model_cache_path)?;
 
-    let store =
-        LanceMemoryStore::new(&store_path, config.collection_name(), &fastembed_cache_path)?;
+    let store = LanceMemoryStore::new(&store_path, config.collection_name(), &model_cache_path)?;
     let graph = KnowledgeGraph::new(knowledge_graph_path)?;
 
     Ok(AppContext {
@@ -701,47 +708,6 @@ async fn open_context(
         store,
         graph,
     })
-}
-
-fn seed_onnxruntime_dylib(target_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    if target_path.is_file() {
-        return Ok(());
-    }
-
-    let Some(parent) = target_path.parent() else {
-        return Ok(());
-    };
-    fs::create_dir_all(parent)?;
-
-    for candidate in bundled_onnxruntime_candidates() {
-        if candidate.is_file() {
-            fs::copy(candidate, target_path)?;
-            break;
-        }
-    }
-
-    Ok(())
-}
-
-fn bundled_onnxruntime_candidates() -> Vec<PathBuf> {
-    let mut candidates = Vec::new();
-
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(parent) = exe.parent() {
-            candidates.push(parent.join("onnxruntime.dll"));
-            candidates.push(parent.join(".mempalace-bin").join("onnxruntime.dll"));
-        }
-    }
-
-    candidates.push(
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .and_then(Path::parent)
-            .map(|path| path.join(".mempalace-bin").join("onnxruntime.dll"))
-            .unwrap_or_else(|| PathBuf::from(".mempalace-bin").join("onnxruntime.dll")),
-    );
-
-    candidates
 }
 
 fn print_init(app: &AppContext) {
@@ -1792,6 +1758,35 @@ async fn run_mine(
         println!("        {}", app.palace_root.display());
     }
 
+    println!("{:=<55}", "");
+
+    Ok(())
+}
+
+async fn run_remine(
+    app: &AppContext,
+    wing: Option<String>,
+    dry_run: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    println!();
+    println!("{:=<55}", "");
+    println!("  MemPalace Remine");
+    println!("{:=<55}", "");
+    println!("  Model: potion-base-32M (model2vec-rs)");
+    if dry_run {
+        println!("  DRY RUN: true");
+    }
+
+    let total = app.store.remine_all(wing.as_deref()).await?;
+    if total == 0 {
+        println!("  No drawers to remine.");
+        return Ok(());
+    }
+
+    println!();
+    println!("{:=<55}", "");
+    println!("  Done.");
+    println!("  Drawers re-embedded: {total}");
     println!("{:=<55}", "");
 
     Ok(())

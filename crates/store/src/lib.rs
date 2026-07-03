@@ -1,7 +1,6 @@
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, HashSet},
-    env,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
@@ -12,7 +11,6 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
-use fastembed::{EmbeddingModel, TextEmbedding, TextInitOptions};
 use futures::TryStreamExt;
 use lancedb::{
     DistanceType,
@@ -23,15 +21,14 @@ use lancedb::{
     },
     query::{ExecutableQuery, QueryBase, QueryExecutionOptions, Select},
 };
+use model2vec_rs::model::StaticModel;
 
 use mempalace_core::{
     Drawer, DrawerMetadata, MemoryStore, MempalaceError, Result, RoomStatus, SearchHit,
     SearchQuery, StoreStatus,
 };
 
-const DEFAULT_EMBEDDING_MODEL: EmbeddingModel = EmbeddingModel::AllMiniLML6V2;
-// Bound ONNX working-set size when one source file expands into hundreds of chunks.
-const EMBEDDING_BATCH_SIZE: usize = 16;
+const DEFAULT_MODEL_REPO: &str = "minishlab/potion-base-32M";
 const RESULT_COLUMNS: &[&str] = &[
     "id",
     "content",
@@ -60,22 +57,30 @@ impl LanceMemoryStore {
     pub fn new(
         palace_path: impl Into<PathBuf>,
         table_name: impl Into<String>,
-        cache_dir: impl Into<PathBuf>,
+        model_dir: impl Into<PathBuf>,
     ) -> Result<Self> {
-        configure_onnxruntime_dylib_path();
-        let model = DEFAULT_EMBEDDING_MODEL;
-        let dim = TextEmbedding::get_model_info(&model)
-            .map_err(|err| MempalaceError::Embedding(err.to_string()))?
-            .dim;
+        let model_dir = model_dir.into();
+        let model_path = model_dir.join("potion-base-32M");
+        let repo_or_path = if model_path.join("config.json").exists() {
+            model_path.to_string_lossy().to_string()
+        } else {
+            DEFAULT_MODEL_REPO.to_owned()
+        };
+
+        let model = StaticModel::from_pretrained(&repo_or_path, None, None, None)
+            .map_err(|err| MempalaceError::Embedding(err.to_string()))?;
+        let dim = model
+            .encode(&["dim".to_string()])
+            .first()
+            .map(|vec| vec.len())
+            .unwrap_or(384);
 
         Ok(Self {
             palace_path: palace_path.into(),
             table_name: table_name.into(),
-            embedder: Arc::new(EmbeddingBackend::FastEmbed {
-                model,
+            embedder: Arc::new(EmbeddingBackend::Model2Vec {
                 dim,
-                cache_dir: cache_dir.into(),
-                inner: Mutex::new(None),
+                inner: Mutex::new(Some(model)),
             }),
             connection: Arc::new(Mutex::new(None)),
             table: Arc::new(Mutex::new(None)),
@@ -130,6 +135,30 @@ impl LanceMemoryStore {
             .delete(&format!("source_file = '{}'", sql_escape(source_file)))
             .await?;
         Ok(deleted.num_deleted_rows as usize)
+    }
+
+    pub async fn remine_all(&self, wing: Option<&str>) -> Result<usize> {
+        let drawers = self.list_drawers(wing).await?;
+        let total = drawers.len();
+        if total == 0 {
+            return Ok(0);
+        }
+
+        let conn = self.connect().await?;
+        if conn.open_table(&self.table_name).execute().await.is_ok() {
+            conn.drop_table(&self.table_name, &[]).await?;
+            *self
+                .table
+                .lock()
+                .map_err(|_| MempalaceError::LockPoisoned("lancedb_table"))? = None;
+            *self
+                .indices_ready
+                .lock()
+                .map_err(|_| MempalaceError::LockPoisoned("lancedb_indices_ready"))? = false;
+        }
+
+        self.add_drawers(drawers).await?;
+        Ok(total)
     }
 
     pub async fn room_counts(&self) -> Result<Vec<RoomStatus>> {
@@ -717,61 +746,10 @@ impl MemoryStore for LanceMemoryStore {
     }
 }
 
-fn configure_onnxruntime_dylib_path() {
-    if let Some(existing_path) = env::var_os("ORT_DYLIB_PATH") {
-        if PathBuf::from(existing_path).is_file() {
-            return;
-        }
-    }
-
-    for candidate in onnxruntime_candidates() {
-        if candidate.is_file() {
-            unsafe {
-                env::set_var("ORT_DYLIB_PATH", candidate);
-            }
-            return;
-        }
-    }
-}
-
-fn onnxruntime_candidates() -> Vec<PathBuf> {
-    let mut candidates = Vec::new();
-
-    if let Some(home_dir) = dirs::home_dir() {
-        candidates.push(home_dir.join(".mempalace").join("onnxruntime.dll"));
-    }
-
-    if let Ok(exe) = env::current_exe() {
-        if let Some(parent) = exe.parent() {
-            candidates.push(parent.join("onnxruntime.dll"));
-            candidates.push(parent.join(".mempalace-bin").join("onnxruntime.dll"));
-        }
-    }
-
-    if let Some(workspace_root) = workspace_root() {
-        candidates.push(
-            workspace_root
-                .join(".mempalace-bin")
-                .join("onnxruntime.dll"),
-        );
-    }
-
-    candidates
-}
-
-fn workspace_root() -> Option<PathBuf> {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()?
-        .parent()
-        .map(Path::to_path_buf)
-}
-
 enum EmbeddingBackend {
-    FastEmbed {
-        model: EmbeddingModel,
+    Model2Vec {
         dim: usize,
-        cache_dir: PathBuf,
-        inner: Mutex<Option<TextEmbedding>>,
+        inner: Mutex<Option<StaticModel>>,
     },
     #[cfg(test)]
     Deterministic { dim: usize },
@@ -780,7 +758,7 @@ enum EmbeddingBackend {
 impl EmbeddingBackend {
     fn dimension(&self) -> usize {
         match self {
-            Self::FastEmbed { dim, .. } => *dim,
+            Self::Model2Vec { dim, .. } => *dim,
             #[cfg(test)]
             Self::Deterministic { dim } => *dim,
         }
@@ -796,36 +774,15 @@ impl EmbeddingBackend {
 
     fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
         match self {
-            Self::FastEmbed {
-                model,
-                cache_dir,
-                inner,
-                ..
-            } => {
-                let mut guard = inner
+            Self::Model2Vec { inner, .. } => {
+                let guard = inner
                     .lock()
-                    .map_err(|_| MempalaceError::LockPoisoned("fastembed"))?;
-                if guard.is_none() {
-                    let options = TextInitOptions::new(model.clone())
-                        .with_cache_dir(cache_dir.clone())
-                        .with_show_download_progress(false);
-                    *guard = Some(
-                        TextEmbedding::try_new(options)
-                            .map_err(|err| MempalaceError::Embedding(err.to_string()))?,
-                    );
-                }
-
-                let embedder = guard.as_mut().ok_or_else(|| {
-                    MempalaceError::Embedding("embedder not initialized".to_owned())
-                })?;
-                let mut embeddings = Vec::with_capacity(texts.len());
-                for batch in embedding_batches(texts) {
-                    let batch_embeddings = embedder
-                        .embed(batch, Some(batch.len()))
-                        .map_err(|err| MempalaceError::Embedding(err.to_string()))?;
-                    embeddings.extend(batch_embeddings.into_iter().map(normalize_vector));
-                }
-                Ok(embeddings)
+                    .map_err(|_| MempalaceError::LockPoisoned("model2vec"))?;
+                let model = guard
+                    .as_ref()
+                    .ok_or_else(|| MempalaceError::Embedding("model not initialized".to_owned()))?;
+                let embeddings = model.encode(texts);
+                Ok(embeddings.into_iter().map(normalize_vector).collect())
             }
             #[cfg(test)]
             Self::Deterministic { dim } => Ok(texts
@@ -834,10 +791,6 @@ impl EmbeddingBackend {
                 .collect()),
         }
     }
-}
-
-fn embedding_batches<T>(items: &[T]) -> impl Iterator<Item = &[T]> {
-    items.chunks(EMBEDDING_BATCH_SIZE)
 }
 
 fn sql_escape(value: &str) -> String {
@@ -1054,41 +1007,12 @@ fn stable_hash(value: &str) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use std::{env, ffi::OsString, path::PathBuf};
-
     use tempfile::tempdir;
 
     use super::{
-        Drawer, DrawerMetadata, EMBEDDING_BATCH_SIZE, HYBRID_SCORE_COLUMN, LanceMemoryStore,
-        MemoryStore, SearchHit, SearchQuery, configure_onnxruntime_dylib_path, embedding_batches,
-        identifier_tokens, identifier_variants, onnxruntime_candidates, rerank_search_hits,
+        Drawer, DrawerMetadata, HYBRID_SCORE_COLUMN, LanceMemoryStore, MemoryStore, SearchHit,
+        SearchQuery, identifier_tokens, identifier_variants, rerank_search_hits,
     };
-
-    struct EnvVarRestore {
-        key: &'static str,
-        original: Option<OsString>,
-    }
-
-    impl EnvVarRestore {
-        fn set(key: &'static str, value: &str) -> Self {
-            let original = env::var_os(key);
-            unsafe {
-                env::set_var(key, value);
-            }
-            Self { key, original }
-        }
-    }
-
-    impl Drop for EnvVarRestore {
-        fn drop(&mut self) {
-            unsafe {
-                match &self.original {
-                    Some(value) => env::set_var(self.key, value),
-                    None => env::remove_var(self.key),
-                }
-            }
-        }
-    }
 
     fn drawer(id: &str, content: &str, wing: &str, room: &str) -> Drawer {
         Drawer {
@@ -1339,44 +1263,5 @@ mod tests {
 
         rerank_search_hits(&mut hits, &query);
         assert_eq!(hits[0].drawer.id, "code");
-    }
-
-    #[test]
-    fn onnxruntime_candidates_include_user_and_repo_paths() {
-        let candidates = onnxruntime_candidates();
-        assert!(
-            candidates
-                .iter()
-                .any(|path| path.ends_with(".mempalace\\onnxruntime.dll"))
-        );
-        assert!(
-            candidates
-                .iter()
-                .any(|path| path.ends_with(".mempalace-bin\\onnxruntime.dll"))
-        );
-    }
-
-    #[test]
-    fn configure_onnxruntime_path_replaces_invalid_existing_env_path() {
-        let stale_path = r".cortana\.cortana-bin\onnxruntime.dll";
-        let _restore = EnvVarRestore::set("ORT_DYLIB_PATH", stale_path);
-
-        configure_onnxruntime_dylib_path();
-
-        let configured = env::var_os("ORT_DYLIB_PATH")
-            .map(PathBuf::from)
-            .expect("ORT_DYLIB_PATH should be configured");
-        assert_ne!(configured, PathBuf::from(stale_path));
-        assert!(configured.is_file());
-    }
-
-    #[test]
-    fn embedding_batches_limit_onnx_working_set() {
-        let items = (0..(EMBEDDING_BATCH_SIZE * 2 + 1)).collect::<Vec<_>>();
-        let sizes = embedding_batches(&items)
-            .map(|batch| batch.len())
-            .collect::<Vec<_>>();
-
-        assert_eq!(sizes, vec![EMBEDDING_BATCH_SIZE, EMBEDDING_BATCH_SIZE, 1]);
     }
 }

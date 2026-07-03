@@ -75,12 +75,8 @@ impl MempalaceConfig {
         self.config_dir.join("people_map.json")
     }
 
-    pub fn fastembed_cache_path(&self) -> PathBuf {
-        self.config_dir.join("fastembed")
-    }
-
-    pub fn onnxruntime_dylib_path(&self) -> PathBuf {
-        self.config_dir.join("onnxruntime.dll")
+    pub fn model_cache_path(&self) -> PathBuf {
+        self.config_dir.join("models")
     }
 
     pub fn palace_path(&self) -> PathBuf {
@@ -146,7 +142,7 @@ impl MempalaceConfig {
         fs::create_dir_all(&self.config_dir)?;
         fs::create_dir_all(self.palace_path())?;
         fs::create_dir_all(self.store_path())?;
-        fs::create_dir_all(self.fastembed_cache_path())?;
+        fs::create_dir_all(self.model_cache_path())?;
 
         let config_path = self.config_path();
         if !config_path.exists() {
@@ -226,10 +222,7 @@ mod tests {
 
         assert!(path.exists());
         assert!(config.palace_path().exists());
-        assert_eq!(
-            config.onnxruntime_dylib_path(),
-            config_dir.join("onnxruntime.dll")
-        );
+        assert_eq!(config.model_cache_path(), config_dir.join("models"));
     }
 
     #[test]
@@ -293,12 +286,12 @@ mod tests {
     }
 
     #[test]
-    fn fastembed_cache_lives_under_config_dir() {
+    fn model_cache_lives_under_config_dir() {
         let tmp = tempdir().unwrap();
         let config_dir = tmp.path().join(".mempalace");
         let config = MempalaceConfig::load_with_dir(&config_dir).unwrap();
 
-        assert_eq!(config.fastembed_cache_path(), config_dir.join("fastembed"));
+        assert_eq!(config.model_cache_path(), config_dir.join("models"));
     }
 
     #[test]

@@ -37,7 +37,7 @@ The Rust CLI surface is intentionally smaller than the Python package. Do not do
 
 - Keep the README honest about current Rust functionality.
 - Treat `mempalace/README.md` as product context, not as the source of truth for Rust parity.
-- Preserve the current Windows-oriented runtime bootstrapping unless the task is specifically about broadening platform support. The code currently expects `onnxruntime.dll`.
+- The embedding backend uses model2vec-rs (pure Rust, no C dependencies). Models auto-download from HuggingFace Hub on first run.
 - Do not rely on generated or runtime directories such as `target/`, `palace/`, or `palce/` as stable source inputs.
 - If you change CLI flags or command behavior, update `README.md`.
 - If you change the MCP tool surface, update the docs that describe the tool list.

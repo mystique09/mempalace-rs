@@ -1,0 +1,45 @@
+wing: mempalace-rs
+rooms:
+  - name: .config
+    description: "Files from .config/"
+    keywords:
+      - ".config"
+      - ".config"
+  - name: .cortana
+    description: "Files from .cortana/"
+    keywords:
+      - ".cortana"
+      - ".cortana"
+  - name: .github
+    description: "Files from .github/"
+    keywords:
+      - ".github"
+      - ".github"
+  - name: .mempalace_bin
+    description: "Files from .mempalace-bin/"
+    keywords:
+      - ".mempalace_bin"
+      - ".mempalace-bin"
+  - name: bin
+    description: "Files from bin/"
+    keywords:
+      - "bin"
+      - "bin"
+  - name: crates
+    description: "Files from crates/"
+    keywords:
+      - "crates"
+      - "crates"
+  - name: documentation
+    description: "Files from docs/"
+    keywords:
+      - "documentation"
+      - "docs"
+  - name: general
+    description: "Files that don't fit other rooms"
+    keywords: []
+  - name: mempalace_skill
+    description: "Files from mempalace-skill/"
+    keywords:
+      - "mempalace_skill"
+      - "mempalace-skill"

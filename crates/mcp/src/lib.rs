@@ -176,16 +176,14 @@ impl McpServer {
             .unwrap_or_else(|| config.knowledge_graph_path());
         let palace_root = palace_override.unwrap_or_else(|| config.palace_path());
         let store_path = MempalaceConfig::resolve_store_path(&palace_root);
-        let fastembed_cache_path = config.fastembed_cache_path();
-        let onnxruntime_dylib_path = config.onnxruntime_dylib_path();
+        let model_cache_path = config.model_cache_path();
 
         fs::create_dir_all(&palace_root)?;
         fs::create_dir_all(&store_path)?;
-        fs::create_dir_all(&fastembed_cache_path)?;
-        seed_onnxruntime_dylib(&onnxruntime_dylib_path)?;
+        fs::create_dir_all(&model_cache_path)?;
 
         let store =
-            LanceMemoryStore::new(&store_path, config.collection_name(), &fastembed_cache_path)?;
+            LanceMemoryStore::new(&store_path, config.collection_name(), &model_cache_path)?;
         let graph = KnowledgeGraph::new(knowledge_graph_path)?;
 
         Ok(Self {
@@ -1053,52 +1051,6 @@ fn fuzzy_match(query: &str, nodes: &BTreeMap<String, GraphNode>) -> Vec<String> 
         .collect::<Vec<_>>();
     matches.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     matches.into_iter().take(5).map(|(room, _)| room).collect()
-}
-
-fn seed_onnxruntime_dylib(target_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    if target_path.is_file() {
-        return Ok(());
-    }
-
-    let Some(parent) = target_path.parent() else {
-        return Ok(());
-    };
-    fs::create_dir_all(parent)?;
-
-    for candidate in bundled_onnxruntime_candidates() {
-        if candidate.is_file() {
-            fs::copy(candidate, target_path)?;
-            break;
-        }
-    }
-
-    Ok(())
-}
-
-fn bundled_onnxruntime_candidates() -> Vec<PathBuf> {
-    let mut candidates = Vec::new();
-
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(parent) = exe.parent() {
-            candidates.push(parent.join("onnxruntime.dll"));
-            candidates.push(parent.join(".mempalace-bin").join("onnxruntime.dll"));
-        }
-    }
-
-    if let Some(home_dir) = dirs::home_dir() {
-        candidates.push(home_dir.join(".mempalace-bin").join("onnxruntime.dll"));
-    }
-
-    candidates.push(
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .and_then(Path::parent)
-            .and_then(Path::parent)
-            .map(|path| path.join(".mempalace-bin").join("onnxruntime.dll"))
-            .unwrap_or_else(|| PathBuf::from(".mempalace-bin").join("onnxruntime.dll")),
-    );
-
-    candidates
 }
 
 #[cfg(test)]

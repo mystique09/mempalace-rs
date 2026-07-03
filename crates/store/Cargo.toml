@@ -7,8 +7,7 @@ edition.workspace = true
 arrow-array.workspace = true
 arrow-schema.workspace = true
 async-trait.workspace = true
-dirs.workspace = true
-fastembed.workspace = true
+model2vec-rs.workspace = true
 futures.workspace = true
 lancedb.workspace = true
 mempalace-core = { path = "../core" }

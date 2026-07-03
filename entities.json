@@ -1,0 +1,12 @@
+{
+  "entities": {
+    "Embedding": "EMB",
+    "Linux": "LIN",
+    "Platform": "PLA",
+    "Python": "PYT",
+    "Release": "REL",
+    "Task": "TAS",
+    "Windows": "WIN"
+  },
+  "skip_names": []
+}
