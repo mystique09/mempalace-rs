@@ -15,12 +15,12 @@ use mempalace_core::{
 };
 
 const DEFAULT_MODEL_REPO: &str = "minishlab/potion-base-32M";
-const _EMBEDDING_DIM: usize = 384; // potion-base-32M output dimensionality
+const _EMBEDDING_DIM: usize = 512; // potion-base-32M output dimensionality
 
 /// DDL for the vectorlite HNSW virtual table — created only when the extension loads.
 const VECTORLITE_TABLE_DDL: &str = "
 CREATE VIRTUAL TABLE IF NOT EXISTS drawers_vec USING vectorlite(
-    embedding float32[384] cosine,
+    embedding float32[512] cosine,
     hnsw(max_elements=100000)
 );
 ";
@@ -178,7 +178,7 @@ impl SqliteMemoryStore {
 
         Self {
             palace_path,
-            embedder: Arc::new(EmbeddingBackend::Deterministic { dim: 384 }),
+            embedder: Arc::new(EmbeddingBackend::Deterministic { dim: 512 }),
             conn: Arc::new(Mutex::new(conn)),
             vectorlite_available,
         }
