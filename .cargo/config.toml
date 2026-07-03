@@ -7,13 +7,15 @@
 # is never added even when SDKROOT is set. The compiler can't find
 # system headers without -isysroot on this SDK version.
 #
-# Fix: set CFLAGS with -isysroot explicitly, which cc-rs always
-# passes through to the compiler regardless of toolchain detection.
-# Also set MACOSX_DEPLOYMENT_TARGET to match the actual OS (26.4),
-# not the SDK version (26.5).
+# Fix: set SDKROOT so Apple clang can find system headers even when
+# cc-rs skips -isysroot for non-xctoolchain Clang (Command Line Tools).
+# Apple clang natively respects SDKROOT — no -isysroot flag needed.
+# On Linux/Windows, SDKROOT is harmless (unrecognized env, ignored).
+#
+# Also pin MACOSX_DEPLOYMENT_TARGET to match the actual OS (26.4),
+# not the SDK version (26.5). cc-rs only reads this on Apple targets.
 #
 # To find your SDK path: xcrun --show-sdk-path
 [env]
 MACOSX_DEPLOYMENT_TARGET = "26.4"
-CFLAGS = "-isysroot /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk"
-CXXFLAGS = "-isysroot /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk"
+SDKROOT = "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk"
