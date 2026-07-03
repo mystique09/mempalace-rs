@@ -7,8 +7,6 @@ version = "0.1.0"
 edition = "2024"
 
 [workspace.dependencies]
-arrow-array = "57.3.0"
-arrow-schema = "57.3.0"
 async-trait = "0.1.89"
 chrono = { version = "0.4.42", default-features = false, features = ["clock"] }
 clap = { version = "4.5.39", features = ["derive"] }
@@ -16,7 +14,6 @@ dirs = "6.0.0"
 model2vec-rs = "0.2"
 futures = "0.3.31"
 ignore = "0.4.25"
-lancedb = "0.27.2"
 regex = "1.12.2"
 rmcp = { version = "1.2.0", features = ["server", "transport-io", "macros"] }
 rusqlite = { version = "0.39.0", features = ["bundled"] }

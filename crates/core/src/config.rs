@@ -195,12 +195,7 @@ impl MempalaceConfig {
     }
 
     pub fn resolve_store_path(palace_path: impl Into<PathBuf>) -> PathBuf {
-        let palace_path = palace_path.into();
-        if palace_path.join("chroma.sqlite3").exists() {
-            palace_path.join("lancedb")
-        } else {
-            palace_path
-        }
+        palace_path.into()
     }
 }
 
@@ -273,15 +268,13 @@ mod tests {
     }
 
     #[test]
-    fn store_path_moves_under_lancedb_when_chroma_is_present() {
+    fn resolve_store_path_returns_palace_path() {
         let tmp = tempdir().unwrap();
         let palace_path = tmp.path().join("palace");
-        std::fs::create_dir_all(&palace_path).unwrap();
-        std::fs::write(palace_path.join("chroma.sqlite3"), b"legacy").unwrap();
 
         assert_eq!(
             MempalaceConfig::resolve_store_path(&palace_path),
-            palace_path.join("lancedb")
+            palace_path
         );
     }
 

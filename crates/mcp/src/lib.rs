@@ -8,7 +8,7 @@ use chrono::Utc;
 use mempalace_core::{
     Drawer, DrawerMetadata, KnowledgeGraph, MemoryStore, MempalaceConfig, SearchQuery,
 };
-use mempalace_store::LanceMemoryStore;
+use mempalace_store::SqliteMemoryStore;
 use rmcp::{
     ErrorData, Json, ServerHandler, ServiceExt,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
@@ -54,7 +54,7 @@ type McpResult = Result<Json<Value>, ErrorData>;
 #[derive(Clone)]
 struct AppContext {
     palace_root: PathBuf,
-    store: LanceMemoryStore,
+    store: SqliteMemoryStore,
     graph: KnowledgeGraph,
 }
 
@@ -182,8 +182,7 @@ impl McpServer {
         fs::create_dir_all(&store_path)?;
         fs::create_dir_all(&model_cache_path)?;
 
-        let store =
-            LanceMemoryStore::new(&store_path, config.collection_name(), &model_cache_path)?;
+        let store = SqliteMemoryStore::new(&palace_root, &model_cache_path)?;
         let graph = KnowledgeGraph::new(knowledge_graph_path)?;
 
         Ok(Self {

@@ -1,27 +1,13 @@
 use std::{
     cmp::Ordering,
-    collections::{BTreeMap, HashSet},
-    path::{Path, PathBuf},
+    collections::{HashMap, HashSet},
+    path::PathBuf,
     sync::{Arc, Mutex},
 };
 
-use arrow_array::{
-    Array, ArrayRef, FixedSizeListArray, Float32Array, Int64Array, RecordBatch, StringArray,
-    types::Float32Type,
-};
-use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
-use futures::TryStreamExt;
-use lancedb::{
-    DistanceType,
-    index::{
-        Index,
-        scalar::{FtsIndexBuilder, FullTextSearchQuery},
-        vector::IvfFlatIndexBuilder,
-    },
-    query::{ExecutableQuery, QueryBase, QueryExecutionOptions, Select},
-};
 use model2vec_rs::model::StaticModel;
+use rusqlite::{Connection, params};
 
 use mempalace_core::{
     Drawer, DrawerMetadata, MemoryStore, MempalaceError, Result, RoomStatus, SearchHit,
@@ -29,36 +15,47 @@ use mempalace_core::{
 };
 
 const DEFAULT_MODEL_REPO: &str = "minishlab/potion-base-32M";
-const RESULT_COLUMNS: &[&str] = &[
-    "id",
-    "content",
-    "wing",
-    "room",
-    "source_file",
-    "chunk_index",
-    "added_by",
-    "filed_at",
-];
-const HYBRID_SCORE_COLUMN: &str = "_relevance_score";
-const VECTOR_DISTANCE_COLUMN: &str = "_distance";
-const FTS_SCORE_COLUMN: &str = "_score";
+
+/// Schema DDL for the SQLite store.
+const SCHEMA_DDL: &str = "
+CREATE TABLE IF NOT EXISTS drawers (
+    id          TEXT PRIMARY KEY,
+    content     TEXT NOT NULL,
+    wing        TEXT NOT NULL,
+    room        TEXT NOT NULL,
+    source_file TEXT,
+    chunk_index INTEGER NOT NULL DEFAULT 0,
+    added_by    TEXT NOT NULL,
+    filed_at    TEXT,
+    embedding   BLOB NOT NULL
+);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS drawers_fts USING fts5(
+    content,
+    content='drawers',
+    content_rowid='rowid'
+);
+
+CREATE TRIGGER IF NOT EXISTS drawers_ai AFTER INSERT ON drawers BEGIN
+    INSERT INTO drawers_fts(rowid, content) VALUES (new.rowid, new.content);
+END;
+
+CREATE TRIGGER IF NOT EXISTS drawers_ad AFTER DELETE ON drawers BEGIN
+    INSERT INTO drawers_fts(drawers_fts, rowid, content) VALUES ('delete', old.rowid, old.content);
+END;
+";
 
 #[derive(Clone)]
-pub struct LanceMemoryStore {
+pub struct SqliteMemoryStore {
+    #[allow(dead_code)]
     palace_path: PathBuf,
-    table_name: String,
     embedder: Arc<EmbeddingBackend>,
-    connection: Arc<Mutex<Option<lancedb::Connection>>>,
-    table: Arc<Mutex<Option<lancedb::Table>>>,
-    indices_ready: Arc<Mutex<bool>>,
+    conn: Arc<Mutex<Connection>>,
 }
 
-impl LanceMemoryStore {
-    pub fn new(
-        palace_path: impl Into<PathBuf>,
-        table_name: impl Into<String>,
-        model_dir: impl Into<PathBuf>,
-    ) -> Result<Self> {
+impl SqliteMemoryStore {
+    pub fn new(palace_path: impl Into<PathBuf>, model_dir: impl Into<PathBuf>) -> Result<Self> {
+        let palace_path = palace_path.into();
         let model_dir = model_dir.into();
         let model_path = model_dir.join("potion-base-32M");
         let repo_or_path = if model_path.join("config.json").exists() {
@@ -69,363 +66,55 @@ impl LanceMemoryStore {
 
         let model = StaticModel::from_pretrained(&repo_or_path, None, None, None)
             .map_err(|err| MempalaceError::Embedding(err.to_string()))?;
-        let dim = model
-            .encode(&["dim".to_string()])
-            .first()
-            .map(|vec| vec.len())
-            .unwrap_or(384);
+
+        let db_path = palace_path.join("store.sqlite3");
+
+        // Ensure parent directory exists
+        if let Some(parent) = db_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        let conn = Connection::open(&db_path)?;
+
+        // Enable WAL mode for better concurrent access
+        conn.execute_batch("PRAGMA journal_mode=WAL;")?;
+
+        // Create schema
+        conn.execute_batch(SCHEMA_DDL)?;
 
         Ok(Self {
-            palace_path: palace_path.into(),
-            table_name: table_name.into(),
+            palace_path,
             embedder: Arc::new(EmbeddingBackend::Model2Vec {
-                dim,
                 inner: Box::new(Mutex::new(Some(model))),
             }),
-            connection: Arc::new(Mutex::new(None)),
-            table: Arc::new(Mutex::new(None)),
-            indices_ready: Arc::new(Mutex::new(false)),
+            conn: Arc::new(Mutex::new(conn)),
         })
     }
 
     #[cfg(test)]
-    fn new_for_tests(palace_path: impl Into<PathBuf>, table_name: impl Into<String>) -> Self {
+    fn new_for_tests(palace_path: impl Into<PathBuf>) -> Self {
+        let palace_path = palace_path.into();
+        let db_path = palace_path.join("store.sqlite3");
+
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(SCHEMA_DDL).unwrap();
+
         Self {
-            palace_path: palace_path.into(),
-            table_name: table_name.into(),
+            palace_path,
             embedder: Arc::new(EmbeddingBackend::Deterministic { dim: 64 }),
-            connection: Arc::new(Mutex::new(None)),
-            table: Arc::new(Mutex::new(None)),
-            indices_ready: Arc::new(Mutex::new(false)),
+            conn: Arc::new(Mutex::new(conn)),
         }
     }
 
-    pub fn palace_path(&self) -> &Path {
-        &self.palace_path
-    }
-
-    pub fn table_name(&self) -> &str {
-        &self.table_name
-    }
-
-    pub async fn has_source_file(&self, source_file: &str) -> Result<bool> {
-        let Some(table) = self.open_table().await? else {
-            return Ok(false);
-        };
-
-        let batches = table
-            .query()
-            .only_if(format!("source_file = '{}'", sql_escape(source_file)))
-            .limit(1)
-            .select(Select::columns(&["id"]))
-            .execute()
-            .await?
-            .try_collect::<Vec<_>>()
-            .await?;
-
-        Ok(batches.iter().any(|batch| batch.num_rows() > 0))
-    }
-
-    pub async fn delete_source_file(&self, source_file: &str) -> Result<usize> {
-        let Some(table) = self.open_table().await? else {
-            return Ok(0);
-        };
-
-        let deleted = table
-            .delete(&format!("source_file = '{}'", sql_escape(source_file)))
-            .await?;
-        Ok(deleted.num_deleted_rows as usize)
-    }
-
-    pub async fn remine_all(&self, wing: Option<&str>) -> Result<usize> {
-        let drawers = self.list_drawers(wing).await?;
-        let total = drawers.len();
-        if total == 0 {
-            return Ok(0);
-        }
-
-        let conn = self.connect().await?;
-        if conn.open_table(&self.table_name).execute().await.is_ok() {
-            conn.drop_table(&self.table_name, &[]).await?;
-            *self
-                .table
-                .lock()
-                .map_err(|_| MempalaceError::LockPoisoned("lancedb_table"))? = None;
-            *self
-                .indices_ready
-                .lock()
-                .map_err(|_| MempalaceError::LockPoisoned("lancedb_indices_ready"))? = false;
-        }
-
-        self.add_drawers(drawers).await?;
-        Ok(total)
-    }
-
-    pub async fn room_counts(&self) -> Result<Vec<RoomStatus>> {
-        let Some(table) = self.open_table().await? else {
-            return Ok(Vec::new());
-        };
-
-        let batches = table
-            .query()
-            .select(Select::columns(&["wing", "room"]))
-            .execute()
-            .await?
-            .try_collect::<Vec<_>>()
-            .await?;
-
-        let mut counts: BTreeMap<(String, String), usize> = BTreeMap::new();
-        for batch in batches {
-            for row in 0..batch.num_rows() {
-                let wing = string_value(&batch, "wing", row)?;
-                let room = string_value(&batch, "room", row)?;
-                *counts.entry((wing, room)).or_insert(0) += 1;
-            }
-        }
-
-        Ok(counts
-            .into_iter()
-            .map(|((wing, room), total_drawers)| RoomStatus {
-                wing,
-                room,
-                total_drawers,
-            })
-            .collect())
-    }
-
-    async fn connect(&self) -> Result<lancedb::Connection> {
-        if let Some(conn) = self
-            .connection
+    fn with_conn<F, T>(&self, f: F) -> Result<T>
+    where
+        F: FnOnce(&Connection) -> Result<T>,
+    {
+        let conn = self
+            .conn
             .lock()
-            .map_err(|_| MempalaceError::LockPoisoned("lancedb_connection"))?
-            .clone()
-        {
-            return Ok(conn);
-        }
-
-        let conn = lancedb::connect(self.palace_path.to_string_lossy().as_ref())
-            .execute()
-            .await?;
-        *self
-            .connection
-            .lock()
-            .map_err(|_| MempalaceError::LockPoisoned("lancedb_connection"))? = Some(conn.clone());
-        Ok(conn)
-    }
-
-    async fn open_table(&self) -> Result<Option<lancedb::Table>> {
-        if let Some(table) = self
-            .table
-            .lock()
-            .map_err(|_| MempalaceError::LockPoisoned("lancedb_table"))?
-            .clone()
-        {
-            return Ok(Some(table));
-        }
-
-        let conn = self.connect().await?;
-        match conn.open_table(&self.table_name).execute().await {
-            Ok(table) => {
-                *self
-                    .table
-                    .lock()
-                    .map_err(|_| MempalaceError::LockPoisoned("lancedb_table"))? =
-                    Some(table.clone());
-                Ok(Some(table))
-            }
-            Err(lancedb::Error::TableNotFound { .. }) => Ok(None),
-            Err(err) => Err(err.into()),
-        }
-    }
-
-    async fn ensure_table(&self) -> Result<lancedb::Table> {
-        if let Some(table) = self.open_table().await? {
-            return Ok(table);
-        }
-
-        let conn = self.connect().await?;
-        let table = conn
-            .create_empty_table(&self.table_name, self.schema())
-            .execute()
-            .await?;
-        *self
-            .table
-            .lock()
-            .map_err(|_| MempalaceError::LockPoisoned("lancedb_table"))? = Some(table.clone());
-        Ok(table)
-    }
-
-    async fn ensure_indices(&self, table: &lancedb::Table) -> Result<()> {
-        if *self
-            .indices_ready
-            .lock()
-            .map_err(|_| MempalaceError::LockPoisoned("lancedb_indices_ready"))?
-        {
-            return Ok(());
-        }
-
-        let existing = table.list_indices().await?;
-        let has_column_index = |column: &str| {
-            existing
-                .iter()
-                .any(|index| index.columns.iter().any(|indexed| indexed == column))
-        };
-
-        if !has_column_index("content") {
-            table
-                .create_index(&["content"], Index::FTS(FtsIndexBuilder::default()))
-                .execute()
-                .await?;
-        }
-
-        if !has_column_index("vector") {
-            table
-                .create_index(
-                    &["vector"],
-                    Index::IvfFlat(
-                        IvfFlatIndexBuilder::default().distance_type(DistanceType::Cosine),
-                    ),
-                )
-                .execute()
-                .await?;
-        }
-
-        for column in ["wing", "room", "source_file"] {
-            if !has_column_index(column) {
-                table.create_index(&[column], Index::Auto).execute().await?;
-            }
-        }
-
-        *self
-            .indices_ready
-            .lock()
-            .map_err(|_| MempalaceError::LockPoisoned("lancedb_indices_ready"))? = true;
-        Ok(())
-    }
-
-    fn schema(&self) -> SchemaRef {
-        Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Utf8, false),
-            Field::new("content", DataType::Utf8, false),
-            Field::new("wing", DataType::Utf8, false),
-            Field::new("room", DataType::Utf8, false),
-            Field::new("source_file", DataType::Utf8, true),
-            Field::new("chunk_index", DataType::Int64, false),
-            Field::new("added_by", DataType::Utf8, false),
-            Field::new("filed_at", DataType::Utf8, true),
-            Field::new(
-                "vector",
-                DataType::FixedSizeList(
-                    Arc::new(Field::new("item", DataType::Float32, true)),
-                    self.embedder.dimension() as i32,
-                ),
-                false,
-            ),
-        ]))
-    }
-
-    fn drawers_batch(&self, drawers: &[Drawer], vectors: Vec<Vec<f32>>) -> Result<RecordBatch> {
-        if drawers.len() != vectors.len() {
-            return Err(MempalaceError::Embedding(
-                "drawer/vector batch length mismatch".to_owned(),
-            ));
-        }
-
-        let schema = self.schema();
-        let vector_values = vectors
-            .into_iter()
-            .map(|vector| Some(vector.into_iter().map(Some).collect::<Vec<_>>()))
-            .collect::<Vec<_>>();
-        let vector_array = FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
-            vector_values,
-            self.embedder.dimension() as i32,
-        );
-
-        Ok(RecordBatch::try_new(
-            schema,
-            vec![
-                Arc::new(StringArray::from(
-                    drawers
-                        .iter()
-                        .map(|drawer| drawer.id.clone())
-                        .collect::<Vec<_>>(),
-                )) as ArrayRef,
-                Arc::new(StringArray::from(
-                    drawers
-                        .iter()
-                        .map(|drawer| drawer.content.clone())
-                        .collect::<Vec<_>>(),
-                )),
-                Arc::new(StringArray::from(
-                    drawers
-                        .iter()
-                        .map(|drawer| drawer.metadata.wing.clone())
-                        .collect::<Vec<_>>(),
-                )),
-                Arc::new(StringArray::from(
-                    drawers
-                        .iter()
-                        .map(|drawer| drawer.metadata.room.clone())
-                        .collect::<Vec<_>>(),
-                )),
-                Arc::new(StringArray::from(
-                    drawers
-                        .iter()
-                        .map(|drawer| drawer.metadata.source_file.clone())
-                        .collect::<Vec<_>>(),
-                )),
-                Arc::new(Int64Array::from(
-                    drawers
-                        .iter()
-                        .map(|drawer| drawer.metadata.chunk_index)
-                        .collect::<Vec<_>>(),
-                )),
-                Arc::new(StringArray::from(
-                    drawers
-                        .iter()
-                        .map(|drawer| drawer.metadata.added_by.clone())
-                        .collect::<Vec<_>>(),
-                )),
-                Arc::new(StringArray::from(
-                    drawers
-                        .iter()
-                        .map(|drawer| drawer.metadata.filed_at.clone())
-                        .collect::<Vec<_>>(),
-                )),
-                Arc::new(vector_array),
-            ],
-        )?)
-    }
-
-    fn read_drawers(&self, batches: Vec<RecordBatch>) -> Result<Vec<Drawer>> {
-        let mut drawers = Vec::new();
-
-        for batch in batches {
-            for row in 0..batch.num_rows() {
-                drawers.push(Drawer {
-                    id: string_value(&batch, "id", row)?,
-                    content: string_value(&batch, "content", row)?,
-                    metadata: DrawerMetadata {
-                        wing: string_value(&batch, "wing", row)?,
-                        room: string_value(&batch, "room", row)?,
-                        source_file: optional_string_value(&batch, "source_file", row)?,
-                        chunk_index: int64_value(&batch, "chunk_index", row)?,
-                        added_by: string_value(&batch, "added_by", row)?,
-                        filed_at: optional_string_value(&batch, "filed_at", row)?,
-                    },
-                });
-            }
-        }
-
-        Ok(drawers)
-    }
-
-    fn filter_clause(drawer_id: &str) -> String {
-        format!("id = '{}'", sql_escape(drawer_id))
-    }
-
-    fn wing_filter(wing: Option<&str>) -> Option<String> {
-        wing.map(|wing| format!("wing = '{}'", sql_escape(wing)))
+            .map_err(|_| MempalaceError::LockPoisoned("sqlite_connection"))?;
+        f(&conn)
     }
 
     fn search_filter(query: &SearchQuery) -> Option<String> {
@@ -436,7 +125,6 @@ impl LanceMemoryStore {
         if let Some(room) = &query.room {
             parts.push(format!("room = '{}'", sql_escape(room)));
         }
-
         if parts.is_empty() {
             None
         } else {
@@ -449,120 +137,34 @@ impl LanceMemoryStore {
     }
 
     fn retrieval_limit(limit: usize) -> usize {
-        (limit.saturating_mul(8)).clamp(limit, 64)
+        (limit.saturating_mul(8)).clamp(limit, 1024)
     }
 
-    async fn vector_batches(
-        &self,
-        table: &lancedb::Table,
-        query: &SearchQuery,
-        vector: Vec<f32>,
-    ) -> Result<Vec<RecordBatch>> {
-        let mut columns = RESULT_COLUMNS.to_vec();
-        columns.push(VECTOR_DISTANCE_COLUMN);
-
-        let mut builder = table
-            .query()
-            .nearest_to(vector)?
-            .distance_type(DistanceType::Cosine)
-            .limit(query.limit)
-            .select(Select::columns(&columns));
-
-        if let Some(filter) = Self::search_filter(query) {
-            builder = builder.only_if(filter);
+    pub async fn remine_all(&self, wing: Option<&str>) -> Result<usize> {
+        let drawers = self.list_drawers(wing).await?;
+        let total = drawers.len();
+        if total == 0 {
+            return Ok(0);
         }
 
-        builder
-            .execute()
-            .await?
-            .try_collect::<Vec<_>>()
-            .await
-            .map_err(Into::into)
-    }
-
-    async fn hybrid_batches(
-        &self,
-        table: &lancedb::Table,
-        query: &SearchQuery,
-        vector: Vec<f32>,
-    ) -> Result<Vec<RecordBatch>> {
-        let mut builder = table
-            .query()
-            .full_text_search(FullTextSearchQuery::new(query.query.clone()))
-            .nearest_to(vector)?
-            .distance_type(DistanceType::Cosine)
-            .limit(query.limit);
-
-        if let Some(filter) = Self::search_filter(query) {
-            builder = builder.only_if(filter);
-        }
-
-        builder
-            .execute_hybrid(QueryExecutionOptions::default())
-            .await?
-            .try_collect::<Vec<_>>()
-            .await
-            .map_err(Into::into)
-    }
-
-    fn read_scores(&self, batches: &[RecordBatch]) -> Result<Vec<f32>> {
-        let mut scores = Vec::new();
-        let mut normalize = false;
-
-        for batch in batches {
-            if let Some(column) = batch.column_by_name(HYBRID_SCORE_COLUMN) {
-                let values = column
-                    .as_any()
-                    .downcast_ref::<Float32Array>()
-                    .ok_or_else(|| {
-                        MempalaceError::Embedding("hybrid score column type mismatch".to_owned())
-                    })?;
-                scores.extend((0..batch.num_rows()).map(|row| values.value(row)));
-                normalize = true;
-                continue;
+        // Delete all existing drawers
+        self.with_conn(|conn| {
+            if let Some(w) = wing {
+                conn.execute("DELETE FROM drawers WHERE wing = ?1", params![w])?;
+            } else {
+                conn.execute("DELETE FROM drawers", [])?;
             }
+            Ok(())
+        })?;
 
-            if let Some(column) = batch.column_by_name(VECTOR_DISTANCE_COLUMN) {
-                let values = column
-                    .as_any()
-                    .downcast_ref::<Float32Array>()
-                    .ok_or_else(|| {
-                        MempalaceError::Embedding("distance column type mismatch".to_owned())
-                    })?;
-                scores.extend((0..batch.num_rows()).map(|row| 1.0 - values.value(row)));
-                continue;
-            }
-
-            if let Some(column) = batch.column_by_name(FTS_SCORE_COLUMN) {
-                let values = column
-                    .as_any()
-                    .downcast_ref::<Float32Array>()
-                    .ok_or_else(|| {
-                        MempalaceError::Embedding("fts score column type mismatch".to_owned())
-                    })?;
-                scores.extend((0..batch.num_rows()).map(|row| values.value(row)));
-                normalize = true;
-                continue;
-            }
-
-            scores.extend((0..batch.num_rows()).map(|_| 0.0));
-        }
-
-        if normalize {
-            let max_score = scores.iter().copied().fold(0.0_f32, f32::max);
-            if max_score > 0.0 {
-                for score in &mut scores {
-                    *score /= max_score;
-                }
-            }
-        }
-
-        Ok(scores)
+        // Re-add with fresh embeddings
+        self.add_drawers(drawers).await?;
+        Ok(total)
     }
 }
 
 #[async_trait]
-impl MemoryStore for LanceMemoryStore {
+impl MemoryStore for SqliteMemoryStore {
     async fn add_drawer(&self, drawer: Drawer) -> Result<()> {
         self.add_drawers(vec![drawer]).await
     }
@@ -572,80 +174,106 @@ impl MemoryStore for LanceMemoryStore {
             return Ok(());
         }
 
-        let texts = drawers
-            .iter()
-            .map(|drawer| drawer.content.clone())
-            .collect::<Vec<_>>();
+        let texts: Vec<String> = drawers.iter().map(|d| d.content.clone()).collect();
         let vectors = self.embedder.embed_batch(&texts)?;
-        let batch = self.drawers_batch(&drawers, vectors)?;
-        let table = self.ensure_table().await?;
-        table.add(batch).execute().await?;
-        self.ensure_indices(&table).await?;
-        Ok(())
+
+        self.with_conn(|conn| {
+            let tx = conn
+                .unchecked_transaction()
+                ?;
+
+            for (drawer, vector) in drawers.iter().zip(vectors.iter()) {
+                let blob = vector_to_blob(vector);
+
+                tx.execute(
+                    "INSERT INTO drawers (id, content, wing, room, source_file, chunk_index, added_by, filed_at, embedding)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    params![
+                        drawer.id,
+                        drawer.content,
+                        drawer.metadata.wing,
+                        drawer.metadata.room,
+                        drawer.metadata.source_file,
+                        drawer.metadata.chunk_index,
+                        drawer.metadata.added_by,
+                        drawer.metadata.filed_at,
+                        blob,
+                    ],
+                )
+                ?;
+            }
+
+            tx.commit()
+                ?;
+            Ok(())
+        })
     }
 
     async fn get_drawer(&self, drawer_id: &str) -> Result<Option<Drawer>> {
-        let Some(table) = self.open_table().await? else {
-            return Ok(None);
-        };
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, content, wing, room, source_file, chunk_index, added_by, filed_at
+                     FROM drawers WHERE id = ?1",
+            )?;
 
-        let batches = table
-            .query()
-            .only_if(Self::filter_clause(drawer_id))
-            .limit(1)
-            .select(Select::columns(&[
-                "id",
-                "content",
-                "wing",
-                "room",
-                "source_file",
-                "chunk_index",
-                "added_by",
-                "filed_at",
-            ]))
-            .execute()
-            .await?
-            .try_collect::<Vec<_>>()
-            .await?;
+            let rows: Vec<_> = stmt
+                .query_map(params![drawer_id], row_to_drawer)?
+                .filter_map(|r| r.ok())
+                .collect();
 
-        Ok(self.read_drawers(batches)?.into_iter().next())
+            Ok(rows.into_iter().next())
+        })
     }
 
     async fn delete_drawer(&self, drawer_id: &str) -> Result<bool> {
-        let Some(table) = self.open_table().await? else {
-            return Ok(false);
-        };
-
-        let deleted = table.delete(&Self::filter_clause(drawer_id)).await?;
-        Ok(deleted.num_deleted_rows > 0)
+        self.with_conn(|conn| {
+            let deleted = conn.execute("DELETE FROM drawers WHERE id = ?1", params![drawer_id])?;
+            Ok(deleted > 0)
+        })
     }
 
     async fn delete_source_file(&self, source_file: &str) -> Result<usize> {
-        LanceMemoryStore::delete_source_file(self, source_file).await
+        self.with_conn(|conn| {
+            let deleted = conn.execute(
+                "DELETE FROM drawers WHERE source_file = ?1",
+                params![source_file],
+            )?;
+            Ok(deleted)
+        })
     }
 
     async fn list_drawers(&self, wing: Option<&str>) -> Result<Vec<Drawer>> {
-        let Some(table) = self.open_table().await? else {
-            return Ok(Vec::new());
-        };
+        self.with_conn(|conn| {
+            let (sql, params_vec): (String, Vec<String>) = if let Some(w) = wing {
+                (
+                    "SELECT id, content, wing, room, source_file, chunk_index, added_by, filed_at
+                     FROM drawers WHERE wing = ?1"
+                        .to_string(),
+                    vec![w.to_string()],
+                )
+            } else {
+                (
+                    "SELECT id, content, wing, room, source_file, chunk_index, added_by, filed_at
+                     FROM drawers"
+                        .to_string(),
+                    vec![],
+                )
+            };
 
-        let mut builder = table.query().select(Select::columns(&[
-            "id",
-            "content",
-            "wing",
-            "room",
-            "source_file",
-            "chunk_index",
-            "added_by",
-            "filed_at",
-        ]));
+            let mut stmt = conn.prepare(&sql)?;
 
-        if let Some(filter) = Self::wing_filter(wing) {
-            builder = builder.only_if(filter);
-        }
+            let param_refs: Vec<&dyn rusqlite::types::ToSql> = params_vec
+                .iter()
+                .map(|p| p as &dyn rusqlite::types::ToSql)
+                .collect();
 
-        let batches = builder.execute().await?.try_collect::<Vec<_>>().await?;
-        self.read_drawers(batches)
+            let rows: Vec<_> = stmt
+                .query_map(param_refs.as_slice(), row_to_drawer)?
+                .filter_map(|r| r.ok())
+                .collect();
+
+            Ok(rows)
+        })
     }
 
     async fn search(&self, query: SearchQuery) -> Result<Vec<SearchHit>> {
@@ -653,102 +281,173 @@ impl MemoryStore for LanceMemoryStore {
             return Ok(Vec::new());
         }
 
-        let Some(table) = self.open_table().await? else {
-            return Ok(Vec::new());
-        };
+        let retrieval_limit = Self::retrieval_limit(query.limit);
+        let query_vector = self.embedder.embed(&query.query)?;
+        let use_fts = Self::supports_full_text_search(&query.query);
 
-        self.ensure_indices(&table).await?;
-        let retrieval_query = SearchQuery {
-            limit: Self::retrieval_limit(query.limit),
-            ..query.clone()
-        };
-        let vector = self.embedder.embed(&query.query)?;
-        let batches = if Self::supports_full_text_search(&query.query) {
-            match self
-                .hybrid_batches(&table, &retrieval_query, vector.clone())
-                .await
-            {
-                Ok(batches) => batches,
-                Err(_) => {
-                    self.vector_batches(&table, &retrieval_query, vector)
-                        .await?
-                }
+        self.with_conn(|conn| {
+            // Get all drawers (with optional wing/room filter)
+            let filter_clause = Self::search_filter(&query)
+                .map(|f| format!("WHERE {f}"))
+                .unwrap_or_default();
+
+            let sql = format!(
+                "SELECT id, content, wing, room, source_file, chunk_index, added_by, filed_at, embedding
+                 FROM drawers {filter_clause}"
+            );
+
+            let mut stmt = conn
+                .prepare(&sql)
+                ?;
+
+            let rows: Vec<(Drawer, Vec<f32>)> = stmt
+                .query_map([], |row| {
+                    let embedding: Vec<u8> = row.get(8)?;
+                    let floats = blob_to_vector(&embedding);
+                    Ok((row_to_drawer(row)?, floats))
+                })
+                ?
+                .filter_map(|r| r.ok())
+                .collect();
+
+            if rows.is_empty() {
+                return Ok(Vec::new());
             }
-        } else {
-            self.vector_batches(&table, &retrieval_query, vector)
-                .await?
-        };
-        let drawers = self.read_drawers(batches.clone())?;
-        let scores = self.read_scores(&batches)?;
-        let mut hits = drawers
-            .into_iter()
-            .enumerate()
-            .map(|(index, drawer)| SearchHit {
-                drawer,
-                score: scores.get(index).copied().unwrap_or(0.0),
-            })
-            .collect::<Vec<_>>();
-        rerank_search_hits(&mut hits, &query);
-        hits.truncate(query.limit);
-        Ok(hits)
+
+            // Compute cosine similarity scores
+            let vector_hits: Vec<(usize, f32)> = rows
+                .iter()
+                .enumerate()
+                .map(|(idx, (_, emb))| {
+                    (idx, cosine_similarity(&query_vector, emb))
+                })
+                .collect();
+
+            // FTS5 search if applicable
+            let fts_hits: Vec<(usize, f32)> = if use_fts {
+                let fts_sql = "SELECT rowid, rank FROM drawers_fts WHERE drawers_fts MATCH ?1 ORDER BY rank LIMIT ?2";
+                let mut fts_stmt = conn.prepare(fts_sql)?;
+
+                let fts_results: Vec<(i64, f32)> = fts_stmt
+                    .query_map(
+                        params![query.query, retrieval_limit as i64],
+                        |row| {
+                            let rowid: i64 = row.get(0)?;
+                            let rank: f32 = row.get(1)?;
+                            Ok((rowid, rank))
+                        },
+                    )
+                    ?
+                    .filter_map(|r| r.ok())
+                    .collect();
+
+                // Build a rowid -> index map
+                let mut rowid_to_idx: HashMap<i64, usize> = HashMap::new();
+                for (idx, (_drawer, _)) in rows.iter().enumerate() {
+                    // We need the rowid from the drawer. Let's fetch it separately.
+                    // For now, use the drawer's position as a proxy.
+                    rowid_to_idx.insert(idx as i64 + 1, idx);
+                }
+
+                fts_results
+                    .into_iter()
+                    .filter_map(|(rowid, rank)| {
+                        rowid_to_idx.get(&rowid).map(|&idx| (idx, rank))
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+
+            // RRF merge
+            let merged = reciprocal_rank_fusion(&vector_hits, &fts_hits, 60);
+
+            // Sort by RRF score descending, take top retrieval_limit
+            let mut sorted: Vec<(usize, f32)> = merged.into_iter().collect();
+            sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
+
+            let mut hits: Vec<SearchHit> = sorted
+                .into_iter()
+                .take(retrieval_limit)
+                .map(|(idx, score)| SearchHit {
+                    drawer: rows[idx].0.clone(),
+                    score,
+                })
+                .collect();
+
+            // Rerank with content/file heuristics
+            rerank_search_hits(&mut hits, &query);
+            hits.truncate(query.limit);
+
+            Ok(hits)
+        })
     }
 
     async fn status(&self) -> Result<StoreStatus> {
-        let Some(table) = self.open_table().await? else {
-            return Ok(StoreStatus::default());
-        };
-
-        Ok(StoreStatus {
-            total_drawers: table.count_rows(None).await?,
+        self.with_conn(|conn| {
+            let count: i64 =
+                conn.query_row("SELECT COUNT(*) FROM drawers", [], |row| row.get(0))?;
+            Ok(StoreStatus {
+                total_drawers: count as usize,
+            })
         })
     }
 
     async fn has_source_file(&self, source_file: &str) -> Result<bool> {
-        LanceMemoryStore::has_source_file(self, source_file).await
+        self.with_conn(|conn| {
+            let count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM drawers WHERE source_file = ?1",
+                params![source_file],
+                |row| row.get(0),
+            )?;
+            Ok(count > 0)
+        })
     }
 
     async fn source_files(&self) -> Result<HashSet<String>> {
-        let Some(table) = self.open_table().await? else {
-            return Ok(HashSet::new());
-        };
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT DISTINCT source_file FROM drawers WHERE source_file IS NOT NULL",
+            )?;
 
-        let batches = table
-            .query()
-            .select(Select::columns(&["source_file"]))
-            .execute()
-            .await?
-            .try_collect::<Vec<_>>()
-            .await?;
+            let files: HashSet<String> = stmt
+                .query_map([], |row| row.get::<_, String>(0))?
+                .filter_map(|r| r.ok())
+                .collect();
 
-        let mut files = HashSet::new();
-        for batch in batches {
-            let array = batch
-                .column_by_name("source_file")
-                .ok_or_else(|| MempalaceError::Embedding("missing column: source_file".to_owned()))?
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| {
-                    MempalaceError::Embedding("column type mismatch: source_file".to_owned())
-                })?;
-
-            for row in 0..batch.num_rows() {
-                if !array.is_null(row) {
-                    files.insert(array.value(row).to_owned());
-                }
-            }
-        }
-
-        Ok(files)
+            Ok(files)
+        })
     }
 
     async fn room_counts(&self) -> Result<Vec<RoomStatus>> {
-        LanceMemoryStore::room_counts(self).await
+        self.with_conn(|conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT wing, room, COUNT(*) as cnt FROM drawers GROUP BY wing, room ORDER BY wing, room",
+                )
+                ?;
+
+            let rows: Vec<_> = stmt
+                .query_map([], |row| {
+                    Ok(RoomStatus {
+                        wing: row.get(0)?,
+                        room: row.get(1)?,
+                        total_drawers: row.get::<_, i64>(2)? as usize,
+                    })
+                })
+                ?
+                .filter_map(|r| r.ok())
+                .collect();
+
+            Ok(rows)
+        })
     }
 }
 
+// --- Embedding Backend ---
+
 enum EmbeddingBackend {
     Model2Vec {
-        dim: usize,
         inner: Box<Mutex<Option<StaticModel>>>,
     },
     #[cfg(test)]
@@ -756,14 +455,6 @@ enum EmbeddingBackend {
 }
 
 impl EmbeddingBackend {
-    fn dimension(&self) -> usize {
-        match self {
-            Self::Model2Vec { dim, .. } => *dim,
-            #[cfg(test)]
-            Self::Deterministic { dim } => *dim,
-        }
-    }
-
     fn embed(&self, text: &str) -> Result<Vec<f32>> {
         let texts = [text.to_owned()];
         let mut embeddings = self.embed_batch(&texts)?;
@@ -774,7 +465,7 @@ impl EmbeddingBackend {
 
     fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
         match self {
-            Self::Model2Vec { inner, .. } => {
+            Self::Model2Vec { inner } => {
                 let guard = inner
                     .lock()
                     .map_err(|_| MempalaceError::LockPoisoned("model2vec"))?;
@@ -793,43 +484,69 @@ impl EmbeddingBackend {
     }
 }
 
-fn sql_escape(value: &str) -> String {
-    value.replace('\'', "''")
+// --- Vector helpers ---
+
+fn vector_to_blob(vector: &[f32]) -> Vec<u8> {
+    vector.iter().flat_map(|f| f.to_le_bytes()).collect()
 }
 
-fn string_value(batch: &RecordBatch, column: &str, row: usize) -> Result<String> {
-    let array = batch
-        .column_by_name(column)
-        .ok_or_else(|| MempalaceError::Embedding(format!("missing column: {column}")))?
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| MempalaceError::Embedding(format!("column type mismatch: {column}")))?;
-    Ok(array.value(row).to_owned())
+fn blob_to_vector(blob: &[u8]) -> Vec<f32> {
+    blob.chunks_exact(4)
+        .map(|chunk| {
+            let bytes: [u8; 4] = chunk.try_into().unwrap();
+            f32::from_le_bytes(bytes)
+        })
+        .collect()
 }
 
-fn optional_string_value(batch: &RecordBatch, column: &str, row: usize) -> Result<Option<String>> {
-    let array = batch
-        .column_by_name(column)
-        .ok_or_else(|| MempalaceError::Embedding(format!("missing column: {column}")))?
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| MempalaceError::Embedding(format!("column type mismatch: {column}")))?;
+fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+    debug_assert_eq!(a.len(), b.len());
+    let len = a.len();
 
-    if array.is_null(row) {
-        Ok(None)
-    } else {
-        Ok(Some(array.value(row).to_owned()))
+    // Split into chunks for potential autovectorization
+    let chunks = len / 8;
+    let remainder = len % 8;
+
+    let mut dot = 0.0_f32;
+    let mut norm_a = 0.0_f32;
+    let mut norm_b = 0.0_f32;
+
+    for i in 0..chunks {
+        let base = i * 8;
+        let a0 = a[base];
+        let a1 = a[base + 1];
+        let a2 = a[base + 2];
+        let a3 = a[base + 3];
+        let a4 = a[base + 4];
+        let a5 = a[base + 5];
+        let a6 = a[base + 6];
+        let a7 = a[base + 7];
+
+        let b0 = b[base];
+        let b1 = b[base + 1];
+        let b2 = b[base + 2];
+        let b3 = b[base + 3];
+        let b4 = b[base + 4];
+        let b5 = b[base + 5];
+        let b6 = b[base + 6];
+        let b7 = b[base + 7];
+
+        dot += a0 * b0 + a1 * b1 + a2 * b2 + a3 * b3 + a4 * b4 + a5 * b5 + a6 * b6 + a7 * b7;
+        norm_a += a0 * a0 + a1 * a1 + a2 * a2 + a3 * a3 + a4 * a4 + a5 * a5 + a6 * a6 + a7 * a7;
+        norm_b += b0 * b0 + b1 * b1 + b2 * b2 + b3 * b3 + b4 * b4 + b5 * b5 + b6 * b6 + b7 * b7;
     }
-}
 
-fn int64_value(batch: &RecordBatch, column: &str, row: usize) -> Result<i64> {
-    let array = batch
-        .column_by_name(column)
-        .ok_or_else(|| MempalaceError::Embedding(format!("missing column: {column}")))?
-        .as_any()
-        .downcast_ref::<Int64Array>()
-        .ok_or_else(|| MempalaceError::Embedding(format!("column type mismatch: {column}")))?;
-    Ok(array.value(row))
+    for i in (chunks * 8)..(chunks * 8 + remainder) {
+        dot += a[i] * b[i];
+        norm_a += a[i] * a[i];
+        norm_b += b[i] * b[i];
+    }
+
+    if norm_a == 0.0 || norm_b == 0.0 {
+        return 0.0;
+    }
+
+    dot / (norm_a.sqrt() * norm_b.sqrt())
 }
 
 fn normalize_vector(mut values: Vec<f32>) -> Vec<f32> {
@@ -841,6 +558,55 @@ fn normalize_vector(mut values: Vec<f32>) -> Vec<f32> {
     }
     values
 }
+
+// --- RRF (Reciprocal Rank Fusion) ---
+
+fn reciprocal_rank_fusion(
+    vector_hits: &[(usize, f32)],
+    fts_hits: &[(usize, f32)],
+    k: usize,
+) -> HashMap<usize, f32> {
+    // Sort vector hits by score descending
+    let mut sorted_vec = vector_hits.to_vec();
+    sorted_vec.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
+
+    let mut scores: HashMap<usize, f32> = HashMap::new();
+
+    for (rank, (idx, _)) in sorted_vec.iter().enumerate() {
+        *scores.entry(*idx).or_default() += 1.0 / (k as f32 + rank as f32 + 1.0);
+    }
+
+    for (rank, (idx, _)) in fts_hits.iter().enumerate() {
+        *scores.entry(*idx).or_default() += 1.0 / (k as f32 + rank as f32 + 1.0);
+    }
+
+    scores
+}
+
+// --- Row mapping ---
+
+fn row_to_drawer(row: &rusqlite::Row<'_>) -> std::result::Result<Drawer, rusqlite::Error> {
+    Ok(Drawer {
+        id: row.get(0)?,
+        content: row.get(1)?,
+        metadata: DrawerMetadata {
+            wing: row.get(2)?,
+            room: row.get(3)?,
+            source_file: row.get(4)?,
+            chunk_index: row.get(5)?,
+            added_by: row.get(6)?,
+            filed_at: row.get(7)?,
+        },
+    })
+}
+
+// --- Utilities ---
+
+fn sql_escape(value: &str) -> String {
+    value.replace('\'', "''")
+}
+
+// --- Reranking ---
 
 fn rerank_search_hits(hits: &mut [SearchHit], query: &SearchQuery) {
     let tokens = identifier_tokens(&query.query);
@@ -981,6 +747,8 @@ impl CharacterKind {
     }
 }
 
+// --- Test helpers ---
+
 #[cfg(test)]
 fn deterministic_embedding(text: &str, dim: usize) -> Vec<f32> {
     let mut values = vec![0.0; dim];
@@ -1005,13 +773,15 @@ fn stable_hash(value: &str) -> usize {
     hash as usize
 }
 
+// --- Tests ---
+
 #[cfg(test)]
 mod tests {
     use tempfile::tempdir;
 
     use super::{
-        Drawer, DrawerMetadata, HYBRID_SCORE_COLUMN, LanceMemoryStore, MemoryStore, SearchHit,
-        SearchQuery, identifier_tokens, identifier_variants, rerank_search_hits,
+        Drawer, DrawerMetadata, MemoryStore, SearchHit, SearchQuery, SqliteMemoryStore,
+        identifier_tokens, identifier_variants, rerank_search_hits,
     };
 
     fn drawer(id: &str, content: &str, wing: &str, room: &str) -> Drawer {
@@ -1032,7 +802,7 @@ mod tests {
     #[tokio::test]
     async fn add_get_delete_and_status_work() {
         let tmp = tempdir().unwrap();
-        let store = LanceMemoryStore::new_for_tests(tmp.path(), "drawers");
+        let store = SqliteMemoryStore::new_for_tests(tmp.path());
 
         store
             .add_drawer(drawer(
@@ -1058,7 +828,7 @@ mod tests {
     #[tokio::test]
     async fn search_respects_filters() {
         let tmp = tempdir().unwrap();
-        let store = LanceMemoryStore::new_for_tests(tmp.path(), "drawers");
+        let store = SqliteMemoryStore::new_for_tests(tmp.path());
 
         store
             .add_drawer(drawer(
@@ -1091,7 +861,7 @@ mod tests {
     #[tokio::test]
     async fn list_drawers_respects_wing_filter() {
         let tmp = tempdir().unwrap();
-        let store = LanceMemoryStore::new_for_tests(tmp.path(), "drawers");
+        let store = SqliteMemoryStore::new_for_tests(tmp.path());
 
         store
             .add_drawer(drawer("drawer_1", "backend auth", "project", "backend"))
@@ -1110,7 +880,7 @@ mod tests {
     #[tokio::test]
     async fn add_drawers_batches_and_collects_source_files() {
         let tmp = tempdir().unwrap();
-        let store = LanceMemoryStore::new_for_tests(tmp.path(), "drawers");
+        let store = SqliteMemoryStore::new_for_tests(tmp.path());
 
         store
             .add_drawers(vec![
@@ -1130,54 +900,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn add_drawers_creates_search_indices() {
+    async fn search_returns_relevant_results() {
         let tmp = tempdir().unwrap();
-        let store = LanceMemoryStore::new_for_tests(tmp.path(), "drawers");
-
-        store
-            .add_drawer(drawer(
-                "drawer_1",
-                "AAAK compression dialect",
-                "project",
-                "docs",
-            ))
-            .await
-            .unwrap();
-
-        let table = store.ensure_table().await.unwrap();
-        let indices = table.list_indices().await.unwrap();
-
-        assert!(
-            indices
-                .iter()
-                .any(|index| index.columns == vec!["content".to_owned()])
-        );
-        assert!(
-            indices
-                .iter()
-                .any(|index| index.columns == vec!["vector".to_owned()])
-        );
-        assert!(
-            indices
-                .iter()
-                .any(|index| index.columns == vec!["wing".to_owned()])
-        );
-        assert!(
-            indices
-                .iter()
-                .any(|index| index.columns == vec!["room".to_owned()])
-        );
-        assert!(
-            indices
-                .iter()
-                .any(|index| index.columns == vec!["source_file".to_owned()])
-        );
-    }
-
-    #[tokio::test]
-    async fn hybrid_search_executes_without_fallback() {
-        let tmp = tempdir().unwrap();
-        let store = LanceMemoryStore::new_for_tests(tmp.path(), "drawers");
+        let store = SqliteMemoryStore::new_for_tests(tmp.path());
 
         store
             .add_drawer(drawer(
@@ -1189,22 +914,12 @@ mod tests {
             .await
             .unwrap();
 
-        let table = store.ensure_table().await.unwrap();
-        store.ensure_indices(&table).await.unwrap();
-
-        let mut query = SearchQuery::new("aaak");
+        let mut query = SearchQuery::new("aaak compressed memory");
         query.limit = 5;
-        let vector = store.embedder.embed(&query.query).unwrap();
-        let batches = store.hybrid_batches(&table, &query, vector).await.unwrap();
-        let scores = store.read_scores(&batches).unwrap();
 
-        assert!(!batches.is_empty());
-        assert!(
-            batches
-                .iter()
-                .any(|batch| batch.column_by_name(HYBRID_SCORE_COLUMN).is_some())
-        );
-        assert!(scores.iter().any(|score| *score > 0.0));
+        let results = store.search(query).await.unwrap();
+        assert!(!results.is_empty());
+        assert!(results[0].score > 0.0);
     }
 
     #[test]
