@@ -4,14 +4,15 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-arrow-array.workspace = true
-arrow-schema.workspace = true
 async-trait.workspace = true
 model2vec-rs.workspace = true
 futures.workspace = true
-lancedb.workspace = true
+rusqlite.workspace = true
 mempalace-core = { path = "../core" }
 workspace-hack = { version = "0.1", path = "../workspace-hack" }
+
+[build-dependencies]
+zip = "2"
 
 [dev-dependencies]
 tempfile.workspace = true

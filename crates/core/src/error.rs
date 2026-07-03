@@ -19,12 +19,6 @@ pub enum MempalaceError {
     #[error("sqlite error: {0}")]
     Sqlite(#[from] rusqlite::Error),
 
-    #[error("lancedb error: {0}")]
-    LanceDb(#[from] lancedb::Error),
-
-    #[error("arrow error: {0}")]
-    Arrow(#[from] arrow_schema::ArrowError),
-
     #[error("home directory not found")]
     MissingHomeDirectory,
 

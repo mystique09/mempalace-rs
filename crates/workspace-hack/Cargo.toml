@@ -15,48 +15,32 @@ publish = false
 
 ### BEGIN HAKARI SECTION
 [dependencies]
-ahash = { version = "0.8", features = ["serde"] }
-aho-corasick = { version = "1" }
-bytes = { version = "1" }
-either = { version = "1", features = ["use_std"] }
-getrandom = { version = "0.3", default-features = false, features = ["std"] }
-half = { version = "2", features = ["num-traits"] }
-hashbrown-3575ec1268b04181 = { package = "hashbrown", version = "0.15" }
-hashbrown-986da7b5efc2b80e = { package = "hashbrown", version = "0.16" }
-indexmap = { version = "2" }
+crossbeam-utils = { version = "0.8" }
+flate2 = { version = "1" }
+futures-core = { version = "0.3" }
+futures-sink = { version = "0.3" }
+getrandom = { version = "0.3", default-features = false, features = ["std", "wasm_js"] }
+hashbrown = { version = "0.16", default-features = false, features = ["default-hasher"] }
 memchr = { version = "2" }
-num-traits = { version = "0.2", features = ["i128", "libm"] }
+num-traits = { version = "0.2", default-features = false, features = ["i128", "std"] }
 once_cell = { version = "1" }
-petgraph = { version = "0.8" }
-prost = { version = "0.14" }
-prost-types = { version = "0.14" }
-regex = { version = "1" }
-regex-automata = { version = "0.4", default-features = false, features = ["dfa-onepass", "hybrid", "meta", "nfa", "perf", "std", "unicode"] }
-regex-syntax = { version = "0.8" }
 serde = { version = "1", features = ["alloc", "derive", "rc"] }
-serde_core = { version = "1", features = ["alloc", "rc"] }
+serde_core = { version = "1", default-features = false, features = ["alloc", "rc", "result", "std"] }
 serde_json = { version = "1", features = ["alloc"] }
+simd-adler32 = { version = "0.3", default-features = false, features = ["std"] }
 smallvec = { version = "1", default-features = false, features = ["const_generics"] }
-tokio = { version = "1", features = ["full"] }
-tokio-util = { version = "0.7", features = ["codec"] }
+tokio = { version = "1", features = ["io-std", "io-util", "macros", "rt-multi-thread", "sync", "time"] }
+zeroize = { version = "1", features = ["zeroize_derive"] }
 
 [build-dependencies]
-aho-corasick = { version = "1" }
-bytes = { version = "1" }
-either = { version = "1", features = ["use_std"] }
-hashbrown-3575ec1268b04181 = { package = "hashbrown", version = "0.15" }
-hashbrown-986da7b5efc2b80e = { package = "hashbrown", version = "0.16" }
-indexmap = { version = "2" }
+flate2 = { version = "1" }
+getrandom = { version = "0.3", default-features = false, features = ["std", "wasm_js"] }
+hashbrown = { version = "0.16", default-features = false, features = ["default-hasher"] }
 memchr = { version = "2" }
-once_cell = { version = "1" }
-petgraph = { version = "0.8" }
-prost = { version = "0.14" }
-prost-types = { version = "0.14" }
-regex = { version = "1" }
-regex-automata = { version = "0.4", default-features = false, features = ["dfa-onepass", "hybrid", "meta", "nfa", "perf", "std", "unicode"] }
-regex-syntax = { version = "0.8" }
-serde_core = { version = "1", features = ["alloc", "rc"] }
+serde_core = { version = "1", default-features = false, features = ["alloc", "rc", "result", "std"] }
 serde_json = { version = "1", features = ["alloc"] }
+simd-adler32 = { version = "0.3", default-features = false, features = ["std"] }
 syn = { version = "2", features = ["extra-traits", "fold", "full", "visit", "visit-mut"] }
+zeroize = { version = "1", features = ["zeroize_derive"] }
 
 ### END HAKARI SECTION

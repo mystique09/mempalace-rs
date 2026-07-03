@@ -11,7 +11,7 @@ use mempalace_core::{
     SearchQuery, detect_entities, mine_project, scan_for_detection,
 };
 use mempalace_mcp::McpServer;
-use mempalace_store::LanceMemoryStore;
+use mempalace_store::SqliteMemoryStore;
 use serde::Serialize;
 use serde_json::Value;
 
@@ -199,7 +199,7 @@ struct AppContext {
     config: MempalaceConfig,
     palace_root: PathBuf,
     store_path: PathBuf,
-    store: LanceMemoryStore,
+    store: SqliteMemoryStore,
     graph: KnowledgeGraph,
 }
 
@@ -692,13 +692,12 @@ async fn open_context(
         .map(MempalaceConfig::knowledge_graph_path_for_palace)
         .unwrap_or_else(|| config.knowledge_graph_path());
     let palace_root = palace_override.unwrap_or_else(|| config.palace_path());
-    let store_path = MempalaceConfig::resolve_store_path(&palace_root);
+    let store_path = palace_root.join("store.sqlite3");
     let model_cache_path = config.model_cache_path();
     fs::create_dir_all(&palace_root)?;
-    fs::create_dir_all(&store_path)?;
     fs::create_dir_all(&model_cache_path)?;
 
-    let store = LanceMemoryStore::new(&store_path, config.collection_name(), &model_cache_path)?;
+    let store = SqliteMemoryStore::new(&palace_root, &model_cache_path)?;
     let graph = KnowledgeGraph::new(knowledge_graph_path)?;
 
     Ok(AppContext {
@@ -1685,7 +1684,7 @@ async fn run_search(
         println!("no results");
         if legacy_chroma_detected(&app.palace_root, &app.store_path) {
             println!(
-                "note: rust search only covers the LanceDB store at {}",
+                "note: search only covers the SQLite store at {}",
                 app.store_path.display()
             );
         }
