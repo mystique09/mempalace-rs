@@ -542,8 +542,8 @@ impl MemoryStore for SqliteMemoryStore {
                 let mut rowid_to_idx: HashMap<i64, usize> = HashMap::new();
                 if !fts_results.is_empty() && !rows.is_empty() {
                     // Query rowids for current rows
-                    let rowid_sql = "SELECT rowid FROM drawers";
-                    let mut rid_stmt = conn.prepare(rowid_sql)?;
+                    let rowid_sql = format!("SELECT rowid FROM drawers {filter_where}");
+                    let mut rid_stmt = conn.prepare(&rowid_sql)?;
                     let all_rowids: Vec<i64> = rid_stmt
                         .query_map([], |row| row.get(0))?
                         .filter_map(|r| r.ok())
