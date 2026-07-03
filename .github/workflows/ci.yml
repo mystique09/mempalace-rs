@@ -44,7 +44,7 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends protobuf-compiler
+          sudo apt-get install -y --no-install-recommends protobuf-compiler libprotobuf-dev
 
       - name: Cache cargo dependencies
         uses: ubicloud/cache@v4
@@ -78,7 +78,7 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends protobuf-compiler
+          sudo apt-get install -y --no-install-recommends protobuf-compiler libprotobuf-dev
 
       - name: Cache cargo dependencies
         uses: ubicloud/cache@v4

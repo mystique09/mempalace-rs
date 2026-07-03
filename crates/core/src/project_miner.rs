@@ -474,10 +474,10 @@ fn detect_room(
     routing: Option<&ProjectRoutingConfig>,
     project_path: &Path,
 ) -> String {
-    if let Some(routing) = routing {
-        if let Some(room) = detect_room_from_config(filepath, content, routing) {
-            return room;
-        }
+    if let Some(routing) = routing
+        && let Some(room) = detect_room_from_config(filepath, content, routing)
+    {
+        return room;
     }
 
     detect_room_from_path(filepath, project_path)
@@ -887,7 +887,7 @@ mod tests {
         .unwrap();
         fs::create_dir_all(root.join("nested").join("pkg")).unwrap();
         let file = root.join("nested").join("pkg").join("lib.rs");
-        let routing = load_project_config(&file.parent().unwrap().to_path_buf())
+        let routing = load_project_config(file.parent().unwrap())
             .unwrap()
             .unwrap();
 

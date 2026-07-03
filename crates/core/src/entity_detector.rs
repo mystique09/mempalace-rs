@@ -521,7 +521,7 @@ pub fn detect_entities(file_paths: &[PathBuf], max_files: usize) -> Result<Detec
         .sort_by(|left, right| right.confidence.total_cmp(&left.confidence));
     detected
         .uncertain
-        .sort_by(|left, right| right.frequency.cmp(&left.frequency));
+        .sort_by_key(|right| std::cmp::Reverse(right.frequency));
 
     detected.people.truncate(15);
     detected.projects.truncate(10);
