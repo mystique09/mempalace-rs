@@ -1255,10 +1255,8 @@ mod tests {
         // Create a regular table named drawers_vec — this simulates a
         // non-vectorlite table (or a previously-migrated table whose DDL
         // doesn't contain the old max_elements string).
-        conn.execute_batch(
-            "CREATE TABLE drawers_vec (rowid INTEGER PRIMARY KEY, embedding BLOB);",
-        )
-        .unwrap();
+        conn.execute_batch("CREATE TABLE drawers_vec (rowid INTEGER PRIMARY KEY, embedding BLOB);")
+            .unwrap();
 
         // Should be a no-op — table exists but doesn't have the old limit
         assert!(migrate_vectorlite_table(&conn).is_ok());
