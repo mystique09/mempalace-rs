@@ -84,6 +84,16 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Backfill the vectorlite HNSW index from the drawers table.
+    /// Useful when the index gets out of sync or was created before data existed.
+    Backfill,
+    /// Resize the vectorlite HNSW index max_elements.
+    /// Uses vectorlite's save/load operations for O(1) reallocation.
+    Resize {
+        /// New max_elements for the HNSW index (default: 1,000,000).
+        #[arg(long, default_value_t = 1_000_000)]
+        max_elements: u64,
+    },
     Migrate {
         #[arg(long = "from")]
         from_path: PathBuf,
@@ -377,6 +387,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Remine { wing, dry_run } => {
             let app = open_context(cli.palace).await?;
             run_remine(&app, wing, dry_run).await?;
+        }
+        Command::Backfill => {
+            let app = open_context(cli.palace).await?;
+            run_backfill(&app).await?;
+        }
+        Command::Resize { max_elements } => {
+            let app = open_context(cli.palace).await?;
+            run_resize(&app, max_elements).await?;
         }
         Command::Migrate { from_path, dry_run } => {
             let app = open_context(cli.palace).await?;
@@ -1984,6 +2002,54 @@ async fn run_remine(
     println!("{:=<55}", "");
     println!("  Done.");
     println!("  Drawers re-embedded: {total}");
+    println!("{:=<55}", "");
+
+    Ok(())
+}
+
+async fn run_backfill(app: &AppContext) -> Result<(), Box<dyn std::error::Error>> {
+    println!();
+    println!("{:=<55}", "");
+    println!("  MemPalace Backfill");
+    println!("{:=<55}", "");
+    println!("  Store: {}", app.store_path.display());
+    println!("{:-<55}", "");
+
+    let status_before = app.store.status().await?;
+    println!("  Drawers total: {}", status_before.total_drawers);
+    println!();
+
+    app.store.backfill_vector_index().await?;
+
+    println!();
+    println!("{:=<55}", "");
+    println!("  Backfill complete.");
+    println!("{:=<55}", "");
+
+    Ok(())
+}
+
+async fn run_resize(app: &AppContext, max_elements: u64) -> Result<(), Box<dyn std::error::Error>> {
+    println!();
+    println!("{:=<55}", "");
+    println!("  MemPalace Resize");
+    println!("{:=<55}", "");
+    println!("  New max_elements: {max_elements}");
+    println!("  Store: {}", app.store_path.display());
+    println!("{:-<55}", "");
+
+    let status_before = app.store.status().await?;
+    println!("  Drawers before: {}", status_before.total_drawers);
+    println!();
+
+    app.store.resize_vectorlite_table(max_elements).await?;
+
+    let status_after = app.store.status().await?;
+    println!();
+    println!("{:=<55}", "");
+    println!("  Done.");
+    println!("  Drawers after: {}", status_after.total_drawers);
+    println!("  max_elements: {max_elements}");
     println!("{:=<55}", "");
 
     Ok(())

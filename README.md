@@ -4,7 +4,7 @@
 
 - a CLI for initialization, project mining, semantic search, status inspection, and AAAK compression
 - a CLI `tool` namespace that mirrors the Rust MCP tool surface for skill and agent fallback
-- a LanceDB-backed drawer store with FastEmbed embeddings
+- a SQLite + vectorlite drawer store with model2vec-rs (potion-base-32M) embeddings
 - a SQLite knowledge graph for temporal facts
 - a stdio MCP server that exposes the MemPalace tool surface
 
@@ -12,16 +12,15 @@ This repository is not yet a full Rust replacement for the Python package. The c
 
 ## Status
 
-- Implemented in Rust today: `init`, `status`, `mine`, `search`, `compress`, the `tool <MCP_TOOL>` CLI namespace, the LanceDB store, the knowledge graph library, and the MCP server.
+- Implemented in Rust today: `init`, `status`, `mine`, `search`, `compress`, `resize`, `migrate`, `remine`, the `tool <MCP_TOOL>` CLI namespace, the SQLite/vectorlite store, the knowledge graph library, and the MCP server.
 - Still missing from Rust parity: some Python-only workflows from the reference package.
-- Runtime bootstrapping is currently Windows-oriented because the embedding setup looks for `onnxruntime.dll`.
 
 ## Workspace Layout
 
 - `bin/mempalace-rs/` - CLI entry point
 - `bin/mempalace-mcp/` - stdio MCP server binary
 - `crates/core/` - config, AAAK dialect, project miner, knowledge graph, shared types
-- `crates/store/` - LanceDB-backed `MemoryStore` implementation
+- `crates/store/` - SQLite/vectorlite-backed `MemoryStore` implementation with model2vec-rs embeddings
 - `crates/mcp/` - MCP tool definitions and server wiring
 - `crates/workspace-hack/` - cargo-hakari support crate
 - `mempalace/` - reference Python implementation, benchmarks, examples, and upstream docs
@@ -29,9 +28,6 @@ This repository is not yet a full Rust replacement for the Python package. The c
 ## Requirements
 
 - a recent Rust toolchain with Edition 2024 support
-- a local ONNX Runtime dynamic library available as `onnxruntime.dll`
-
-The repository already includes a bundled candidate at [`.mempalace-bin/onnxruntime.dll`](.mempalace-bin/onnxruntime.dll). On first run the CLI and MCP server will seed `~/.mempalace/onnxruntime.dll` if it does not exist.
 
 ## Quick Start
 
@@ -62,7 +58,7 @@ cargo run --bin mempalace-rs -- mine . --wing mempalace-rs
 Search stored drawers:
 
 ```bash
-cargo run --bin mempalace-rs -- search "lancedb index" .
+cargo run --bin mempalace-rs -- search "hnsw index" .
 ```
 
 Inspect counts:
@@ -75,6 +71,12 @@ Preview AAAK compression output:
 
 ```bash
 cargo run --bin mempalace-rs -- compress --wing mempalace-rs --dry-run
+```
+
+Resize the HNSW index for larger capacity:
+
+```bash
+cargo run --bin mempalace-rs -- resize --max-elements 10000000
 ```
 
 Call an MCP-style tool through the CLI:
@@ -98,6 +100,9 @@ cargo run --bin mempalace-mcp
 | `search <QUERY> [SCOPE]` | Runs semantic search with optional wing or room filters; when no explicit wing is supplied, the CLI can infer one from `SCOPE` or the current project root |
 | `mine <DIR>` | Scans text-like project files, skips common binary/media/archive formats, chunks them into drawers, and writes them into a wing |
 | `compress` | Reads stored drawers and emits lossy AAAK summaries, either to stdout (`--dry-run`) or to a generated output file |
+| `resize` | Resizes the vectorlite HNSW index `max_elements` via save/load — fast O(1) reallocation instead of a full rebuild |
+| `migrate` | Migrates drawers from a legacy ChromaDB SQLite database into the current SQLite/vectorlite store |
+| `remine` | Re-embeds all existing drawers with the current model (potion-base-32M) |
 | `tool <MCP_TOOL>` | Exposes the Rust MCP tool surface through the CLI and prints MCP-style JSON for automation, skills, and agent fallback |
 
 Useful flags:
@@ -106,6 +111,8 @@ Useful flags:
 - `init --no-onboarding` skips the interactive bootstrap flow.
 - `mine --exclude-data-files` skips noisy `.json`, `.csv`, and `.sql` files in data-heavy folders when you want a cleaner index than the Python default.
 - `mine --no-gitignore` disables `.gitignore`-aware scanning.
+- `resize --max-elements <N>` sets the new HNSW index capacity (default 1,000,000).
+- `migrate --from <PATH>` imports drawers from a legacy ChromaDB SQLite database.
 - `search --all-wings` disables implicit wing narrowing.
 - `tool --help` lists the mirrored tool names, and `tool <name> --help` shows the tool-specific flags.
 
@@ -129,16 +136,14 @@ Default runtime files live under `~/.mempalace/`:
 - `entity_registry.json` - global onboarding registry for people, aliases, and projects
 - `people_map.json` - optional nickname to canonical-name map
 - `knowledge_graph.sqlite3` - temporal fact storage
-- `fastembed/` - embedding model cache
-- `onnxruntime.dll` - seeded runtime library
-- `palace/` - LanceDB drawer store by default
+- `palace/` - SQLite + vectorlite drawer store by default (`store.sqlite3`)
 
 Environment variables:
 
 - `MEMPALACE_PALACE_PATH`
 - `MEMPAL_PALACE_PATH`
 
-If the chosen palace path contains a legacy `chroma.sqlite3`, the Rust code automatically stores LanceDB data under `palace/lancedb` instead of mixing formats in place.
+If the chosen palace path contains a legacy `chroma.sqlite3`, use `mempalace-rs migrate --from <path>` to import drawers into the current SQLite/vectorlite store.
 
 ## Mining Behavior
 
