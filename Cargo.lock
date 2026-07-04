@@ -1314,10 +1314,12 @@ dependencies = [
  "mempalace-core",
  "mempalace-mcp",
  "mempalace-store",
+ "rusqlite",
  "serde",
  "serde_json",
  "tempfile",
  "tokio",
+ "uuid",
  "workspace-hack",
 ]
 

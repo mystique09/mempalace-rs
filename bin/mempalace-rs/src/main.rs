@@ -7,13 +7,15 @@ use std::{
 
 use clap::{Parser, Subcommand};
 use mempalace_core::{
-    AaakDialect, DetectedEntities, KnowledgeGraph, MemoryStore, MempalaceConfig, MineOptions,
-    SearchQuery, detect_entities, mine_project, scan_for_detection,
+    AaakDialect, DetectedEntities, Drawer, DrawerMetadata, KnowledgeGraph, MemoryStore,
+    MempalaceConfig, MineOptions, SearchQuery, detect_entities, mine_project, scan_for_detection,
 };
 use mempalace_mcp::McpServer;
 use mempalace_store::SqliteMemoryStore;
+use rusqlite::{Connection, params};
 use serde::Serialize;
 use serde_json::Value;
+use uuid::Uuid;
 
 #[derive(Debug, Parser)]
 #[command(name = "mempalace-rs", about = "MemPalace in Rust", version)]
@@ -79,6 +81,12 @@ enum Command {
     Remine {
         #[arg(long)]
         wing: Option<String>,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    Migrate {
+        #[arg(long = "from")]
+        from_path: PathBuf,
         #[arg(long)]
         dry_run: bool,
     },
@@ -370,6 +378,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let app = open_context(cli.palace).await?;
             run_remine(&app, wing, dry_run).await?;
         }
+        Command::Migrate { from_path, dry_run } => {
+            let app = open_context(cli.palace).await?;
+            run_migrate(&app, from_path, dry_run).await?;
+        }
         Command::Tool { command } => {
             let server = McpServer::open_with_palace(cli.palace).await?;
             run_tool_command(&server, command).await?;
@@ -377,6 +389,194 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+async fn run_migrate(
+    app: &AppContext,
+    chroma_db: PathBuf,
+    dry_run: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let chroma_db = chroma_db.canonicalize().unwrap_or(chroma_db);
+    if !chroma_db.exists() {
+        return Err(format!("chroma database not found: {}", chroma_db.display()).into());
+    }
+
+    println!();
+    println!("{:=<55}", "");
+    println!("  MemPalace Migrate");
+    println!("{:=<55}", "");
+    println!("  Source: {}", chroma_db.display());
+    println!("  Target: {}", app.store_path.display());
+    if dry_run {
+        println!("  DRY RUN: true");
+    }
+    println!("{:-<55}", "");
+
+    // Open the old ChromaDB SQLite
+    let drawers = extract_chroma_drawers(&chroma_db)?;
+    println!("  Found {} drawers in ChromaDB", drawers.len());
+
+    if drawers.is_empty() {
+        println!("  Nothing to migrate.");
+        return Ok(());
+    }
+
+    // Show wing/room distribution
+    let mut wing_counts: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    let mut room_counts: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    for d in &drawers {
+        *wing_counts.entry(d.metadata.wing.clone()).or_default() += 1;
+        *room_counts
+            .entry(format!("{}/{}", d.metadata.wing, d.metadata.room))
+            .or_default() += 1;
+    }
+
+    println!();
+    println!("  Distribution:");
+    let mut wings: Vec<_> = wing_counts.iter().collect();
+    wings.sort_by_key(|(_, c)| std::cmp::Reverse(**c));
+    for (wing, count) in wings {
+        println!("    {wing:30} {count} drawers");
+    }
+
+    if dry_run {
+        println!();
+        println!("  Dry run complete. No data written.");
+        return Ok(());
+    }
+
+    // Migrate in batches to avoid memory pressure with very large palaces
+    let batch_size = 256;
+    let total_batches = drawers.len().div_ceil(batch_size);
+
+    for (batch_num, chunk) in drawers.chunks(batch_size).enumerate() {
+        let batch_display = batch_num + 1;
+        println!(
+            "  Migrating batch {batch_display}/{total_batches} ({} drawers)...",
+            chunk.len()
+        );
+        app.store.add_drawers(chunk.to_vec()).await?;
+    }
+
+    let status = app.store.status().await?;
+    println!();
+    println!("{:=<55}", "");
+    println!("  Migration complete.");
+    println!("  Total drawers: {}", status.total_drawers);
+    println!("  Original chroma.sqlite3 was left untouched.");
+    println!("{:=<55}", "");
+
+    Ok(())
+}
+
+/// Extract all drawers from a ChromaDB SQLite database, mirroring the Python
+/// `extract_drawers_from_sqlite` function in the original mempalace.
+fn extract_chroma_drawers(db_path: &PathBuf) -> Result<Vec<Drawer>, Box<dyn std::error::Error>> {
+    let conn = Connection::open(db_path)?;
+
+    // Get all embedding IDs and their documents
+    let mut stmt = conn.prepare(
+        "SELECT e.embedding_id,
+                MAX(CASE WHEN em.key = 'chroma:document' THEN em.string_value END) as document
+         FROM embeddings e
+         JOIN embedding_metadata em ON em.id = e.id
+         GROUP BY e.embedding_id",
+    )?;
+
+    struct ChromaRow {
+        embedding_id: String,
+        document: Option<String>,
+    }
+
+    let rows: Vec<ChromaRow> = stmt
+        .query_map([], |row| {
+            Ok(ChromaRow {
+                embedding_id: row.get(0)?,
+                document: row.get(1)?,
+            })
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    // Prepare metadata query
+    let mut meta_stmt = conn.prepare(
+        "SELECT em.key, em.string_value, em.int_value, em.float_value, em.bool_value
+         FROM embedding_metadata em
+         JOIN embeddings e ON e.id = em.id
+         WHERE e.embedding_id = ?1
+           AND em.key NOT LIKE 'chroma:%'",
+    )?;
+
+    let mut drawers = Vec::with_capacity(rows.len());
+
+    for row in rows {
+        let document = match row.document {
+            Some(doc) if !doc.trim().is_empty() => doc,
+            _ => continue,
+        };
+
+        let meta_rows: Vec<_> = meta_stmt
+            .query_map(params![row.embedding_id], |mr| {
+                Ok((
+                    mr.get::<_, String>(0)?,
+                    mr.get::<_, Option<String>>(1)?,
+                    mr.get::<_, Option<i64>>(2)?,
+                    mr.get::<_, Option<f64>>(3)?,
+                    mr.get::<_, Option<bool>>(4)?,
+                ))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        let mut metadata: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        for (key, string_val, int_val, float_val, bool_val) in meta_rows {
+            let value = if let Some(s) = string_val {
+                s
+            } else if let Some(i) = int_val {
+                i.to_string()
+            } else if let Some(f) = float_val {
+                f.to_string()
+            } else if let Some(b) = bool_val {
+                b.to_string()
+            } else {
+                continue;
+            };
+            metadata.insert(key, value);
+        }
+
+        let wing = metadata
+            .get("wing")
+            .cloned()
+            .unwrap_or_else(|| "chroma-legacy".to_owned());
+        let room = metadata
+            .get("room")
+            .cloned()
+            .unwrap_or_else(|| "general".to_owned());
+        let source_file = metadata.get("source_file").cloned();
+        let added_by = metadata
+            .get("added_by")
+            .cloned()
+            .unwrap_or_else(|| "migration".to_owned());
+        let filed_at = metadata.get("filed_at").cloned();
+
+        drawers.push(Drawer {
+            id: Uuid::now_v7().to_string(),
+            content: document,
+            metadata: DrawerMetadata {
+                wing,
+                room,
+                source_file,
+                chunk_index: 0,
+                added_by,
+                filed_at,
+            },
+        });
+    }
+
+    Ok(drawers)
 }
 
 async fn run_tool_command(
