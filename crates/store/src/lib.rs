@@ -379,8 +379,24 @@ impl SqliteMemoryStore {
         let snapshot_path = self.palace_path.join("resize_snapshot.hnsw");
         let snapshot_str = snapshot_path.to_string_lossy().to_string();
 
-        // Save index → recreate table → load (hnswlib auto-resizes on load)
-        self.try_save_load_resize(&conn, &table_ddl, &snapshot_str, max_elements)?;
+        // Save index → recreate table → load (hnswlib auto-resizes on load).
+        // Falls back to a full rebuild when save/load isn't available (e.g., CI
+        // builds of vectorlite that lack index serde support).
+        let used_fast_path = self
+            .try_save_load_resize(&conn, &table_ddl, &snapshot_str, max_elements)
+            .is_ok();
+
+        if !used_fast_path {
+            // Full rebuild: drop old table, create new, recreate triggers.
+            let _ = conn.execute_batch("DROP TRIGGER IF EXISTS drawers_vec_ai;");
+            let _ = conn.execute_batch("DROP TRIGGER IF EXISTS drawers_vec_ad;");
+            let _ = conn.execute_batch("DROP TABLE IF EXISTS drawers_vec;");
+            conn.execute_batch(&table_ddl)?;
+            conn.execute_batch(VECTORLITE_TRIGGER_DDL)?;
+            eprintln!(
+                "note: resized vector index to max_elements={max_elements} via full rebuild (save/load not available)"
+            );
+        }
 
         // Backfill any rows that may have been missed (e.g. if the index was
         // empty before resize). Uses new max_elements capacity.
@@ -1408,14 +1424,18 @@ mod tests {
             return;
         }
 
-        // Manually set up the old table with the too-low max_elements
+        // Replace the default table with one that has the old, too-low max_elements.
+        // Must drop the existing table first — IF NOT EXISTS is a no-op otherwise.
         store.with_conn(|conn| {
             let old_table_ddl = "
-                CREATE VIRTUAL TABLE IF NOT EXISTS drawers_vec USING vectorlite(
+                CREATE VIRTUAL TABLE drawers_vec USING vectorlite(
                     embedding float32[512] cosine,
                     hnsw(max_elements=100000)
                 );
             ";
+            conn.execute_batch("DROP TRIGGER IF EXISTS drawers_vec_ai;").unwrap();
+            conn.execute_batch("DROP TRIGGER IF EXISTS drawers_vec_ad;").unwrap();
+            conn.execute_batch("DROP TABLE IF EXISTS drawers_vec;").unwrap();
             conn.execute_batch(old_table_ddl).unwrap();
             conn.execute_batch(super::VECTORLITE_TRIGGER_DDL).unwrap();
 
