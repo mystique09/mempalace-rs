@@ -14,7 +14,9 @@ mempalace-core = { path = "../../crates/core" }
 mempalace-store = { path = "../../crates/store" }
 serde.workspace = true
 serde_json.workspace = true
+rusqlite.workspace = true
 tokio.workspace = true
+uuid.workspace = true
 workspace-hack = { version = "0.1", path = "../../crates/workspace-hack" }
 
 [dev-dependencies]
