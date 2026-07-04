@@ -84,6 +84,13 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Resize the vectorlite HNSW index max_elements. Drops and recreates the
+    /// drawers_vec virtual table, then repopulates from existing embeddings.
+    Resize {
+        /// New max_elements for the HNSW index (default: 1,000,000).
+        #[arg(long, default_value_t = 1_000_000)]
+        max_elements: u64,
+    },
     Migrate {
         #[arg(long = "from")]
         from_path: PathBuf,
@@ -377,6 +384,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Remine { wing, dry_run } => {
             let app = open_context(cli.palace).await?;
             run_remine(&app, wing, dry_run).await?;
+        }
+        Command::Resize { max_elements } => {
+            let app = open_context(cli.palace).await?;
+            run_resize(&app, max_elements).await?;
         }
         Command::Migrate { from_path, dry_run } => {
             let app = open_context(cli.palace).await?;
@@ -1984,6 +1995,35 @@ async fn run_remine(
     println!("{:=<55}", "");
     println!("  Done.");
     println!("  Drawers re-embedded: {total}");
+    println!("{:=<55}", "");
+
+    Ok(())
+}
+
+async fn run_resize(
+    app: &AppContext,
+    max_elements: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    println!();
+    println!("{:=<55}", "");
+    println!("  MemPalace Resize");
+    println!("{:=<55}", "");
+    println!("  New max_elements: {max_elements}");
+    println!("  Store: {}", app.store_path.display());
+    println!("{:-<55}", "");
+
+    let status_before = app.store.status().await?;
+    println!("  Drawers before: {}", status_before.total_drawers);
+    println!();
+
+    app.store.resize_vectorlite_table(max_elements).await?;
+
+    let status_after = app.store.status().await?;
+    println!();
+    println!("{:=<55}", "");
+    println!("  Done.");
+    println!("  Drawers after: {}", status_after.total_drawers);
+    println!("  max_elements: {max_elements}");
     println!("{:=<55}", "");
 
     Ok(())

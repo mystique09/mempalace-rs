@@ -105,10 +105,10 @@ fn try_load_vectorlite(conn: &Connection) -> bool {
     false
 }
 
-/// Migrate old vectorlite tables that were created with too-low `max_elements`.
-/// Drops and recreates the table with the new limit, then repopulates from
-/// existing `drawers` embeddings.
-fn migrate_vectorlite_table(conn: &Connection) -> Result<()> {
+/// Check whether the vectorlite table has an old (too-low) `max_elements` setting
+/// and print a one-time warning to stderr. This is intentionally lightweight:
+/// it only queries the DDL, does NOT rebuild anything.
+fn warn_if_vectorlite_table_needs_resize(conn: &Connection) {
     let table_exists: bool = conn
         .query_row(
             "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='drawers_vec'",
@@ -119,35 +119,25 @@ fn migrate_vectorlite_table(conn: &Connection) -> Result<()> {
         .unwrap_or(false);
 
     if !table_exists {
-        return Ok(());
+        return;
     }
 
-    let sql: String = conn.query_row(
+    let sql: rusqlite::Result<String> = conn.query_row(
         "SELECT sql FROM sqlite_master WHERE type='table' AND name='drawers_vec'",
         [],
         |row| row.get(0),
-    )?;
+    );
 
-    // Only migrate tables with the known-too-low limit
-    if !sql.contains("max_elements=100000") {
-        return Ok(());
+    let Ok(sql) = sql else {
+        return;
+    };
+
+    // Trailing paren distinguishes 100000) from 1000000) — only match the old 100k limit.
+    if sql.contains("max_elements=100000)") {
+        eprintln!(
+            "note: vector index has old max_elements=100000. Run `mempalace-rs resize` to upgrade."
+        );
     }
-
-    // Drop triggers first (they depend on the table), then the table
-    conn.execute_batch("DROP TRIGGER IF EXISTS drawers_vec_ai;")?;
-    conn.execute_batch("DROP TRIGGER IF EXISTS drawers_vec_ad;")?;
-    conn.execute_batch("DROP TABLE IF EXISTS drawers_vec;")?;
-
-    // Re-create with the new limit
-    conn.execute_batch(VECTORLITE_TABLE_DDL)?;
-    conn.execute_batch(VECTORLITE_TRIGGER_DDL)?;
-
-    // Repopulate from existing drawer embeddings
-    conn.execute_batch(
-        "INSERT INTO drawers_vec(rowid, embedding) SELECT rowid, embedding FROM drawers;",
-    )?;
-
-    Ok(())
 }
 
 #[derive(Clone)]
@@ -191,8 +181,8 @@ impl SqliteMemoryStore {
         // Try to load the vectorlite HNSW extension
         let mut vectorlite_available = try_load_vectorlite(&conn);
         if vectorlite_available {
-            // Migrate old vectorlite tables with too-low max_elements before creating new ones
-            let _ = migrate_vectorlite_table(&conn);
+            // Warn if the vectorlite table has the old 100k limit (but don't rebuild here)
+            warn_if_vectorlite_table_needs_resize(&conn);
             // Create vectorlite virtual table and sync triggers;
             // if creation fails (e.g. low-memory CI), fall back to no vectorlite.
             let created = conn.execute_batch(VECTORLITE_TABLE_DDL).is_ok()
@@ -298,6 +288,59 @@ impl SqliteMemoryStore {
         // Re-add with fresh embeddings
         self.add_drawers(drawers).await?;
         Ok(total)
+    }
+
+    /// Resize the vectorlite HNSW index to a new `max_elements` limit.
+    /// Drops and recreates the `drawers_vec` virtual table, then repopulates
+    /// from the existing `drawers` embeddings. This is an explicit,
+    /// user-initiated operation — it does NOT run automatically during `mine`.
+    pub async fn resize_vectorlite_table(&self, max_elements: u64) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| MempalaceError::LockPoisoned("sqlite_connection"))?;
+
+        if !self.vectorlite_available {
+            return Err(MempalaceError::Embedding(
+                "vectorlite extension is not available".to_owned(),
+            ));
+        }
+
+        let table_exists: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='drawers_vec'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|c| c > 0)
+            .unwrap_or(false);
+
+        if !table_exists {
+            return Err(MempalaceError::Embedding(
+                "drawers_vec table does not exist yet; run `mine` first to create it".to_owned(),
+            ));
+        }
+
+        // Build the new DDL with the requested max_elements
+        let table_ddl = format!(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS drawers_vec USING vectorlite(\n    embedding float32[512] cosine,\n    hnsw(max_elements={max_elements})\n);\n"
+        );
+
+        // Drop triggers first (they depend on the table), then the table
+        conn.execute_batch("DROP TRIGGER IF EXISTS drawers_vec_ai;")?;
+        conn.execute_batch("DROP TRIGGER IF EXISTS drawers_vec_ad;")?;
+        conn.execute_batch("DROP TABLE IF EXISTS drawers_vec;")?;
+
+        // Re-create with the new limit
+        conn.execute_batch(&table_ddl)?;
+        conn.execute_batch(VECTORLITE_TRIGGER_DDL)?;
+
+        // Repopulate from existing drawer embeddings
+        conn.execute_batch(
+            "INSERT INTO drawers_vec(rowid, embedding) SELECT rowid, embedding FROM drawers;",
+        )?;
+
+        Ok(())
     }
 }
 
@@ -1044,7 +1087,7 @@ mod tests {
 
     use super::{
         Drawer, DrawerMetadata, MemoryStore, SearchHit, SearchQuery, SqliteMemoryStore,
-        identifier_tokens, identifier_variants, migrate_vectorlite_table, rerank_search_hits,
+        identifier_tokens, identifier_variants, rerank_search_hits,
     };
 
     fn drawer(id: &str, content: &str, wing: &str, room: &str) -> Drawer {
@@ -1243,105 +1286,80 @@ mod tests {
         assert_eq!(hits[0].drawer.id, "code");
     }
 
-    #[test]
-    fn migrate_vectorlite_no_table_returns_ok() {
+    #[tokio::test]
+    async fn resize_vectorlite_no_table_returns_err() {
         let tmp = tempdir().unwrap();
-        let db_path = tmp.path().join("store.sqlite3");
-        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let store = SqliteMemoryStore::new_for_tests(tmp.path());
 
-        // No schema, no table → early return Ok
-        assert!(migrate_vectorlite_table(&conn).is_ok());
+        // Drop drawers_vec to simulate no table
+        store.with_conn(|conn| {
+            conn.execute_batch("DROP TABLE IF EXISTS drawers_vec;").unwrap();
+            Ok(())
+        }).unwrap();
+
+        // No drawers_vec table → error (user should mine first)
+        let result = store.resize_vectorlite_table(500_000).await;
+        assert!(result.is_err());
     }
 
-    #[test]
-    fn migrate_vectorlite_non_vectorlite_table_is_noop() {
+    #[tokio::test]
+    async fn resize_vectorlite_old_limit_rebuilds_with_new_limit() {
         let tmp = tempdir().unwrap();
-        let db_path = tmp.path().join("store.sqlite3");
-        let conn = rusqlite::Connection::open(&db_path).unwrap();
-
-        // Create a regular table named drawers_vec — this simulates a
-        // non-vectorlite table (or a previously-migrated table whose DDL
-        // doesn't contain the old max_elements string).
-        conn.execute_batch("CREATE TABLE drawers_vec (rowid INTEGER PRIMARY KEY, embedding BLOB);")
-            .unwrap();
-
-        // Should be a no-op — table exists but doesn't have the old limit
-        assert!(migrate_vectorlite_table(&conn).is_ok());
-
-        // Table should still exist untouched
-        let count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='drawers_vec'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(count, 1);
-    }
-
-    #[test]
-    fn migrate_vectorlite_old_limit_triggers_rebuild() {
-        let tmp = tempdir().unwrap();
-        let db_path = tmp.path().join("store.sqlite3");
-        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let store = SqliteMemoryStore::new_for_tests(tmp.path());
 
         // Must have vectorlite for this test
-        if !super::try_load_vectorlite(&conn) {
-            eprintln!("vectorlite not available, skipping migration rebuild test");
+        if !store.vectorlite_available {
+            eprintln!("vectorlite not available, skipping resize rebuild test");
             return;
         }
 
-        // Set up the old schema with the too-low max_elements
-        conn.execute_batch(super::SCHEMA_DDL).unwrap();
+        // Manually set up the old table with the too-low max_elements
+        store.with_conn(|conn| {
+            let old_table_ddl = "
+                CREATE VIRTUAL TABLE IF NOT EXISTS drawers_vec USING vectorlite(
+                    embedding float32[512] cosine,
+                    hnsw(max_elements=100000)
+                );
+            ";
+            conn.execute_batch(old_table_ddl).unwrap();
+            conn.execute_batch(super::VECTORLITE_TRIGGER_DDL).unwrap();
 
-        let old_table_ddl = "
-            CREATE VIRTUAL TABLE IF NOT EXISTS drawers_vec USING vectorlite(
-                embedding float32[512] cosine,
-                hnsw(max_elements=100000)
+            // Insert a drawer with a zero embedding
+            let zero_embedding: Vec<f32> = vec![0.0f32; 512];
+            let emb_bytes: Vec<u8> = zero_embedding
+                .iter()
+                .flat_map(|f| f.to_le_bytes())
+                .collect();
+            conn.execute(
+                "INSERT INTO drawers (id, content, wing, room, added_by, embedding) VALUES (?1,?2,?3,?4,?5,?6)",
+                rusqlite::params!["test", "test content", "test", "test", "test", emb_bytes],
+            ).unwrap();
+            Ok(())
+        }).unwrap();
+
+        // Run resize with custom max_elements
+        store.resize_vectorlite_table(500_000).await.unwrap();
+
+        // Verify the new table has the requested max_elements
+        store.with_conn(|conn| {
+            let sql: String = conn
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE type='table' AND name='drawers_vec'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(
+                sql.contains("max_elements=500000"),
+                "expected max_elements=500000 in DDL, got: {sql}"
             );
-        ";
-        conn.execute_batch(old_table_ddl).unwrap();
-        conn.execute_batch(super::VECTORLITE_TRIGGER_DDL).unwrap();
 
-        // Insert a drawer with a zero embedding so the trigger populates drawers_vec
-        let zero_embedding: Vec<f32> = vec![0.0f32; 512];
-        let emb_bytes: Vec<u8> = zero_embedding
-            .iter()
-            .flat_map(|f| f.to_le_bytes())
-            .collect();
-
-        conn.execute(
-            "INSERT INTO drawers (id, content, wing, room, added_by, embedding) VALUES (?1,?2,?3,?4,?5,?6)",
-            rusqlite::params!["test", "test content", "test", "test", "test", emb_bytes],
-        )
-        .unwrap();
-
-        // Verify the drawer is in the source table
-        let old_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM drawers", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(old_count, 1);
-
-        // Run migration
-        migrate_vectorlite_table(&conn).unwrap();
-
-        // Verify the new table has the updated max_elements
-        let sql: String = conn
-            .query_row(
-                "SELECT sql FROM sqlite_master WHERE type='table' AND name='drawers_vec'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert!(
-            sql.contains("max_elements=1000000"),
-            "expected max_elements=1000000 in DDL, got: {sql}"
-        );
-
-        // Verify the source data still exists (repopulation sources from drawers)
-        let new_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM drawers", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(new_count, 1, "source data should survive migration");
+            // Verify source data still exists
+            let count: i64 = conn
+                .query_row("SELECT COUNT(*) FROM drawers", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(count, 1, "source data should survive resize");
+            Ok(())
+        }).unwrap();
     }
 }
