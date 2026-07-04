@@ -294,7 +294,6 @@ impl SqliteMemoryStore {
     /// Uses vectorlite's save/load operations to avoid a full HNSW graph rebuild.
     /// During `load`, hnswlib's `LoadFrom` passes the new `max_elements` and
     /// internally calls `resizeIndex` — O(1) reallocation instead of O(n log n) rebuild.
-    /// Falls back to full rebuild when save/load is unsupported (older vectorlite).
     pub async fn resize_vectorlite_table(&self, max_elements: u64) -> Result<()> {
         let conn = self
             .conn
@@ -327,32 +326,19 @@ impl SqliteMemoryStore {
             "CREATE VIRTUAL TABLE IF NOT EXISTS drawers_vec USING vectorlite(\n    embedding float32[512] cosine,\n    hnsw(max_elements={max_elements})\n);\n"
         );
 
-        // Try fast path: save index → recreate → load (auto-resize on load)
         let snapshot_path = self.palace_path.join("resize_snapshot.hnsw");
         let snapshot_str = snapshot_path.to_string_lossy().to_string();
 
-        if self.try_save_load_resize(&conn, &table_ddl, &snapshot_str, max_elements).is_err() {
-            // Fallback: full rebuild from scratch
-            eprintln!("note: save/load resize unavailable (older vectorlite?); falling back to full rebuild…");
+        // Save index → recreate table → load (hnswlib auto-resizes on load)
+        self.try_save_load_resize(&conn, &table_ddl, &snapshot_str, max_elements)?;
 
-            conn.execute_batch("DROP TRIGGER IF EXISTS drawers_vec_ai;")?;
-            conn.execute_batch("DROP TRIGGER IF EXISTS drawers_vec_ad;")?;
-            conn.execute_batch("DROP TABLE IF EXISTS drawers_vec;")?;
-            conn.execute_batch(&table_ddl)?;
-            conn.execute_batch(VECTORLITE_TRIGGER_DDL)?;
-            conn.execute_batch(
-                "INSERT INTO drawers_vec(rowid, embedding) SELECT rowid, embedding FROM drawers;",
-            )?;
-        }
-
-        // Clean up temp file regardless of path taken
+        // Clean up temp file
         let _ = std::fs::remove_file(&snapshot_path);
 
         Ok(())
     }
 
-    /// Try the fast save/load path. Returns Ok(()) on success, Err if the
-    /// vectorlite build doesn't support save/load operations.
+    /// Save the HNSW index → recreate table with new max_elements → load (auto-resize).
     fn try_save_load_resize(
         &self,
         conn: &Connection,

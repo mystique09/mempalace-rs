@@ -84,9 +84,8 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Resize the vectorlite HNSW index max_elements. Uses vectorlite's
-    /// save/load operations for O(1) reallocation when supported, falling back
-    /// to a full rebuild from existing embeddings on older vectorlite builds.
+    /// Resize the vectorlite HNSW index max_elements.
+    /// Uses vectorlite's save/load operations for O(1) reallocation.
     Resize {
         /// New max_elements for the HNSW index (default: 1,000,000).
         #[arg(long, default_value_t = 1_000_000)]
