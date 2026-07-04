@@ -21,7 +21,7 @@ const _EMBEDDING_DIM: usize = 512; // potion-base-32M output dimensionality
 const VECTORLITE_TABLE_DDL: &str = "
 CREATE VIRTUAL TABLE IF NOT EXISTS drawers_vec USING vectorlite(
     embedding float32[512] cosine,
-    hnsw(max_elements=100000)
+    hnsw(max_elements=10000000)
 );
 ";
 
@@ -105,6 +105,51 @@ fn try_load_vectorlite(conn: &Connection) -> bool {
     false
 }
 
+/// Migrate old vectorlite tables that were created with too-low `max_elements`.
+/// Drops and recreates the table with the new limit, then repopulates from
+/// existing `drawers` embeddings.
+fn migrate_vectorlite_table(conn: &Connection) -> Result<()> {
+    let table_exists: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='drawers_vec'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|c| c > 0)
+        .unwrap_or(false);
+
+    if !table_exists {
+        return Ok(());
+    }
+
+    let sql: String = conn.query_row(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='drawers_vec'",
+        [],
+        |row| row.get(0),
+    )?;
+
+    // Only migrate tables with the known-too-low limit
+    if !sql.contains("max_elements=100000") {
+        return Ok(());
+    }
+
+    // Drop triggers first (they depend on the table), then the table
+    conn.execute_batch("DROP TRIGGER IF EXISTS drawers_vec_ai;")?;
+    conn.execute_batch("DROP TRIGGER IF EXISTS drawers_vec_ad;")?;
+    conn.execute_batch("DROP TABLE IF EXISTS drawers_vec;")?;
+
+    // Re-create with the new limit
+    conn.execute_batch(VECTORLITE_TABLE_DDL)?;
+    conn.execute_batch(VECTORLITE_TRIGGER_DDL)?;
+
+    // Repopulate from existing drawer embeddings
+    conn.execute_batch(
+        "INSERT INTO drawers_vec(rowid, embedding) SELECT rowid, embedding FROM drawers;",
+    )?;
+
+    Ok(())
+}
+
 #[derive(Clone)]
 pub struct SqliteMemoryStore {
     #[allow(dead_code)]
@@ -146,6 +191,8 @@ impl SqliteMemoryStore {
         // Try to load the vectorlite HNSW extension
         let vectorlite_available = try_load_vectorlite(&conn);
         if vectorlite_available {
+            // Migrate old vectorlite tables with too-low max_elements before creating new ones
+            let _ = migrate_vectorlite_table(&conn);
             // Create vectorlite virtual table and sync triggers
             let _ = conn.execute_batch(VECTORLITE_TABLE_DDL);
             let _ = conn.execute_batch(VECTORLITE_TRIGGER_DDL);
