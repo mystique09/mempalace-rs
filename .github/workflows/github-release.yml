@@ -23,6 +23,10 @@ on:
         default: false
         type: boolean
 
+concurrency:
+  group: ${{ github.workflow }}-${{ inputs.version }}
+  cancel-in-progress: false
+
 jobs:
   build-linux-release:
     runs-on: ubicloud-standard-2

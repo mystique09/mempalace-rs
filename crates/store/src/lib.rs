@@ -278,6 +278,15 @@ impl SqliteMemoryStore {
         (limit.saturating_mul(8)).clamp(limit, 1024)
     }
 
+    /// Delete all drawers in a wing. Cascades to FTS and vector index via triggers.
+    /// Returns the number of deleted drawers.
+    pub async fn delete_wing(&self, wing: &str) -> Result<usize> {
+        self.with_conn(|conn| {
+            let deleted = conn.execute("DELETE FROM drawers WHERE wing = ?1", params![wing])?;
+            Ok(deleted)
+        })
+    }
+
     pub async fn remine_all(&self, wing: Option<&str>) -> Result<usize> {
         let drawers = self.list_drawers(wing).await?;
         let total = drawers.len();

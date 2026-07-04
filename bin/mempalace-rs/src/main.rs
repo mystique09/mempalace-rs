@@ -87,6 +87,10 @@ enum Command {
     /// Backfill the vectorlite HNSW index from the drawers table.
     /// Useful when the index gets out of sync or was created before data existed.
     Backfill,
+    DeleteWing {
+        #[arg(long = "wing")]
+        wing: String,
+    },
     /// Resize the vectorlite HNSW index max_elements.
     /// Uses vectorlite's save/load operations for O(1) reallocation.
     Resize {
@@ -148,6 +152,10 @@ enum ToolCommand {
     DeleteDrawer {
         #[arg(long = "drawer-id")]
         drawer_id: String,
+    },
+    DeleteWing {
+        #[arg(long)]
+        wing: String,
     },
     KgQuery {
         #[arg(long)]
@@ -392,6 +400,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let app = open_context(cli.palace).await?;
             run_backfill(&app).await?;
         }
+        Command::DeleteWing { wing } => {
+            let app = open_context(cli.palace).await?;
+            let count = app.store.delete_wing(&wing).await?;
+            println!("Deleted {count} drawers from wing '{wing}'");
+        }
         Command::Resize { max_elements } => {
             let app = open_context(cli.palace).await?;
             run_resize(&app, max_elements).await?;
@@ -635,6 +648,10 @@ async fn run_tool_command(
             .map_err(io::Error::other)?,
         ToolCommand::DeleteDrawer { drawer_id } => server
             .tool_delete_drawer(drawer_id)
+            .await
+            .map_err(io::Error::other)?,
+        ToolCommand::DeleteWing { wing } => server
+            .tool_delete_wing(wing)
             .await
             .map_err(io::Error::other)?,
         ToolCommand::KgQuery {
