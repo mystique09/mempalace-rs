@@ -2000,10 +2000,7 @@ async fn run_remine(
     Ok(())
 }
 
-async fn run_resize(
-    app: &AppContext,
-    max_elements: u64,
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_resize(app: &AppContext, max_elements: u64) -> Result<(), Box<dyn std::error::Error>> {
     println!();
     println!("{:=<55}", "");
     println!("  MemPalace Resize");

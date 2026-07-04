@@ -1292,10 +1292,13 @@ mod tests {
         let store = SqliteMemoryStore::new_for_tests(tmp.path());
 
         // Drop drawers_vec to simulate no table
-        store.with_conn(|conn| {
-            conn.execute_batch("DROP TABLE IF EXISTS drawers_vec;").unwrap();
-            Ok(())
-        }).unwrap();
+        store
+            .with_conn(|conn| {
+                conn.execute_batch("DROP TABLE IF EXISTS drawers_vec;")
+                    .unwrap();
+                Ok(())
+            })
+            .unwrap();
 
         // No drawers_vec table → error (user should mine first)
         let result = store.resize_vectorlite_table(500_000).await;
@@ -1341,25 +1344,27 @@ mod tests {
         store.resize_vectorlite_table(500_000).await.unwrap();
 
         // Verify the new table has the requested max_elements
-        store.with_conn(|conn| {
-            let sql: String = conn
-                .query_row(
-                    "SELECT sql FROM sqlite_master WHERE type='table' AND name='drawers_vec'",
-                    [],
-                    |row| row.get(0),
-                )
-                .unwrap();
-            assert!(
-                sql.contains("max_elements=500000"),
-                "expected max_elements=500000 in DDL, got: {sql}"
-            );
+        store
+            .with_conn(|conn| {
+                let sql: String = conn
+                    .query_row(
+                        "SELECT sql FROM sqlite_master WHERE type='table' AND name='drawers_vec'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert!(
+                    sql.contains("max_elements=500000"),
+                    "expected max_elements=500000 in DDL, got: {sql}"
+                );
 
-            // Verify source data still exists
-            let count: i64 = conn
-                .query_row("SELECT COUNT(*) FROM drawers", [], |row| row.get(0))
-                .unwrap();
-            assert_eq!(count, 1, "source data should survive resize");
-            Ok(())
-        }).unwrap();
+                // Verify source data still exists
+                let count: i64 = conn
+                    .query_row("SELECT COUNT(*) FROM drawers", [], |row| row.get(0))
+                    .unwrap();
+                assert_eq!(count, 1, "source data should survive resize");
+                Ok(())
+            })
+            .unwrap();
     }
 }
