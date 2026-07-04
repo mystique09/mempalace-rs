@@ -21,7 +21,7 @@ const _EMBEDDING_DIM: usize = 512; // potion-base-32M output dimensionality
 const VECTORLITE_TABLE_DDL: &str = "
 CREATE VIRTUAL TABLE IF NOT EXISTS drawers_vec USING vectorlite(
     embedding float32[512] cosine,
-    hnsw(max_elements=1000000)
+    hnsw(max_elements=5000000)
 );
 ";
 
@@ -63,6 +63,8 @@ END;
 CREATE TRIGGER IF NOT EXISTS drawers_ad AFTER DELETE ON drawers BEGIN
     INSERT INTO drawers_fts(drawers_fts, rowid, content) VALUES ('delete', old.rowid, old.content);
 END;
+
+CREATE INDEX IF NOT EXISTS idx_drawers_wing_room ON drawers(wing, room);
 ";
 
 fn try_load_vectorlite(conn: &Connection) -> bool {
@@ -132,10 +134,11 @@ fn warn_if_vectorlite_table_needs_resize(conn: &Connection) {
         return;
     };
 
-    // Trailing paren distinguishes 100000) from 1000000) — only match the old 100k limit.
-    if sql.contains("max_elements=100000)") {
+    // Detect undersized max_elements. Current DDL uses 5M; warn on old limits.
+    let undersized = sql.contains("max_elements=100000)") || sql.contains("max_elements=1000000)");
+    if undersized {
         eprintln!(
-            "note: vector index has old max_elements=100000. Run `mempalace-rs resize` to upgrade."
+            "note: vector index has undersized max_elements. Run `mempalace-rs resize 5000000` to upgrade."
         );
     }
 }
@@ -175,6 +178,10 @@ impl SqliteMemoryStore {
         // Enable WAL mode for better concurrent access
         conn.execute_batch("PRAGMA journal_mode=WAL;")?;
 
+        // Tune for large databases — mmap lets the OS manage hot pages lazily
+        conn.execute_batch("PRAGMA mmap_size = 2147483648;")?; // 2 GiB, OS pages lazily
+        conn.execute_batch("PRAGMA cache_size = -262144;")?; // 256MB page cache (32× default)
+
         // Create schema
         conn.execute_batch(SCHEMA_DDL)?;
 
@@ -189,6 +196,9 @@ impl SqliteMemoryStore {
                 && conn.execute_batch(VECTORLITE_TRIGGER_DDL).is_ok();
             if !created {
                 vectorlite_available = false;
+            } else {
+                // Backfill is handled by the `backfill` subcommand, not at
+                // init time, to avoid blocking MCP startup with index builds.
             }
         }
 
@@ -290,6 +300,46 @@ impl SqliteMemoryStore {
         Ok(total)
     }
 
+    /// Backfill the HNSW index with any existing rows that were inserted
+    /// before vectorlite was enabled or after the index was recreated.
+    /// The triggers only fire on new INSERTs — this catches everything else.
+    pub async fn backfill_vector_index(&self) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| MempalaceError::LockPoisoned("sqlite_connection"))?;
+
+        if !self.vectorlite_available {
+            return Err(MempalaceError::Embedding(
+                "vectorlite extension is not available".to_owned(),
+            ));
+        }
+
+        let table_exists: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='drawers_vec'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|c| c > 0)
+            .unwrap_or(false);
+
+        if !table_exists {
+            return Err(MempalaceError::Embedding(
+                "drawers_vec table does not exist yet; run `mine` first to create it".to_owned(),
+            ));
+        }
+
+        eprintln!("Backfilling vector index...");
+        let affected = conn.execute(
+            "INSERT OR IGNORE INTO drawers_vec(rowid, embedding) SELECT rowid, embedding FROM drawers",
+            [],
+        )?;
+        eprintln!("Backfill complete: {affected} rows inserted into index");
+
+        Ok(())
+    }
+
     /// Resize the vectorlite HNSW index to a new `max_elements` limit.
     /// Uses vectorlite's save/load operations to avoid a full HNSW graph rebuild.
     /// During `load`, hnswlib's `LoadFrom` passes the new `max_elements` and
@@ -331,6 +381,15 @@ impl SqliteMemoryStore {
 
         // Save index → recreate table → load (hnswlib auto-resizes on load)
         self.try_save_load_resize(&conn, &table_ddl, &snapshot_str, max_elements)?;
+
+        // Backfill any rows that may have been missed (e.g. if the index was
+        // empty before resize). Uses new max_elements capacity.
+        eprintln!("note: backfilling vector index after resize...");
+        let _ = conn.execute(
+            "INSERT OR IGNORE INTO drawers_vec(rowid, embedding) SELECT rowid, embedding FROM drawers",
+            [],
+        );
+        eprintln!("note: vector index backfill complete");
 
         // Clean up temp file
         let _ = std::fs::remove_file(&snapshot_path);
