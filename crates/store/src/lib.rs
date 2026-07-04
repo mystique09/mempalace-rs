@@ -21,7 +21,7 @@ const _EMBEDDING_DIM: usize = 512; // potion-base-32M output dimensionality
 const VECTORLITE_TABLE_DDL: &str = "
 CREATE VIRTUAL TABLE IF NOT EXISTS drawers_vec USING vectorlite(
     embedding float32[512] cosine,
-    hnsw(max_elements=10000000)
+    hnsw(max_elements=1000000)
 );
 ";
 
@@ -189,13 +189,17 @@ impl SqliteMemoryStore {
         conn.execute_batch(SCHEMA_DDL)?;
 
         // Try to load the vectorlite HNSW extension
-        let vectorlite_available = try_load_vectorlite(&conn);
+        let mut vectorlite_available = try_load_vectorlite(&conn);
         if vectorlite_available {
             // Migrate old vectorlite tables with too-low max_elements before creating new ones
             let _ = migrate_vectorlite_table(&conn);
-            // Create vectorlite virtual table and sync triggers
-            let _ = conn.execute_batch(VECTORLITE_TABLE_DDL);
-            let _ = conn.execute_batch(VECTORLITE_TRIGGER_DDL);
+            // Create vectorlite virtual table and sync triggers;
+            // if creation fails (e.g. low-memory CI), fall back to no vectorlite.
+            let created = conn.execute_batch(VECTORLITE_TABLE_DDL).is_ok()
+                && conn.execute_batch(VECTORLITE_TRIGGER_DDL).is_ok();
+            if !created {
+                vectorlite_available = false;
+            }
         }
 
         Ok(Self {
@@ -217,10 +221,13 @@ impl SqliteMemoryStore {
         conn.execute_batch(SCHEMA_DDL).unwrap();
 
         // Try loading vectorlite in tests too, but tests work fine without it
-        let vectorlite_available = try_load_vectorlite(&conn);
+        let mut vectorlite_available = try_load_vectorlite(&conn);
         if vectorlite_available {
-            let _ = conn.execute_batch(VECTORLITE_TABLE_DDL);
-            let _ = conn.execute_batch(VECTORLITE_TRIGGER_DDL);
+            let created = conn.execute_batch(VECTORLITE_TABLE_DDL).is_ok()
+                && conn.execute_batch(VECTORLITE_TRIGGER_DDL).is_ok();
+            if !created {
+                vectorlite_available = false;
+            }
         }
 
         Self {
@@ -1327,8 +1334,8 @@ mod tests {
             )
             .unwrap();
         assert!(
-            sql.contains("max_elements=10000000"),
-            "expected max_elements=10000000 in DDL, got: {sql}"
+            sql.contains("max_elements=1000000"),
+            "expected max_elements=1000000 in DDL, got: {sql}"
         );
 
         // Verify the source data still exists (repopulation sources from drawers)
