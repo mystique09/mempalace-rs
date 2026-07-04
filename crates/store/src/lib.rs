@@ -291,9 +291,10 @@ impl SqliteMemoryStore {
     }
 
     /// Resize the vectorlite HNSW index to a new `max_elements` limit.
-    /// Drops and recreates the `drawers_vec` virtual table, then repopulates
-    /// from the existing `drawers` embeddings. This is an explicit,
-    /// user-initiated operation — it does NOT run automatically during `mine`.
+    /// Uses vectorlite's save/load operations to avoid a full HNSW graph rebuild.
+    /// During `load`, hnswlib's `LoadFrom` passes the new `max_elements` and
+    /// internally calls `resizeIndex` — O(1) reallocation instead of O(n log n) rebuild.
+    /// Falls back to full rebuild when save/load is unsupported (older vectorlite).
     pub async fn resize_vectorlite_table(&self, max_elements: u64) -> Result<()> {
         let conn = self
             .conn
@@ -326,19 +327,65 @@ impl SqliteMemoryStore {
             "CREATE VIRTUAL TABLE IF NOT EXISTS drawers_vec USING vectorlite(\n    embedding float32[512] cosine,\n    hnsw(max_elements={max_elements})\n);\n"
         );
 
-        // Drop triggers first (they depend on the table), then the table
+        // Try fast path: save index → recreate → load (auto-resize on load)
+        let snapshot_path = self.palace_path.join("resize_snapshot.hnsw");
+        let snapshot_str = snapshot_path.to_string_lossy().to_string();
+
+        if self.try_save_load_resize(&conn, &table_ddl, &snapshot_str, max_elements).is_err() {
+            // Fallback: full rebuild from scratch
+            eprintln!("note: save/load resize unavailable (older vectorlite?); falling back to full rebuild…");
+
+            conn.execute_batch("DROP TRIGGER IF EXISTS drawers_vec_ai;")?;
+            conn.execute_batch("DROP TRIGGER IF EXISTS drawers_vec_ad;")?;
+            conn.execute_batch("DROP TABLE IF EXISTS drawers_vec;")?;
+            conn.execute_batch(&table_ddl)?;
+            conn.execute_batch(VECTORLITE_TRIGGER_DDL)?;
+            conn.execute_batch(
+                "INSERT INTO drawers_vec(rowid, embedding) SELECT rowid, embedding FROM drawers;",
+            )?;
+        }
+
+        // Clean up temp file regardless of path taken
+        let _ = std::fs::remove_file(&snapshot_path);
+
+        Ok(())
+    }
+
+    /// Try the fast save/load path. Returns Ok(()) on success, Err if the
+    /// vectorlite build doesn't support save/load operations.
+    fn try_save_load_resize(
+        &self,
+        conn: &Connection,
+        table_ddl: &str,
+        snapshot_path: &str,
+        max_elements: u64,
+    ) -> Result<()> {
+        // 1. Save current HNSW index to temp file
+        conn.execute(
+            "INSERT INTO drawers_vec(operation, path) VALUES('save', ?1)",
+            params![snapshot_path],
+        )?;
+
+        // 2. Tear down old table
         conn.execute_batch("DROP TRIGGER IF EXISTS drawers_vec_ai;")?;
         conn.execute_batch("DROP TRIGGER IF EXISTS drawers_vec_ad;")?;
         conn.execute_batch("DROP TABLE IF EXISTS drawers_vec;")?;
 
-        // Re-create with the new limit
-        conn.execute_batch(&table_ddl)?;
+        // 3. Create new table with larger max_elements
+        conn.execute_batch(table_ddl)?;
+
+        // 4. Load index — hnswlib auto-resizes during LoadFrom
+        conn.execute(
+            "INSERT INTO drawers_vec(operation, path) VALUES('load', ?1)",
+            params![snapshot_path],
+        )?;
+
+        // 5. Recreate triggers for ongoing sync
         conn.execute_batch(VECTORLITE_TRIGGER_DDL)?;
 
-        // Repopulate from existing drawer embeddings
-        conn.execute_batch(
-            "INSERT INTO drawers_vec(rowid, embedding) SELECT rowid, embedding FROM drawers;",
-        )?;
+        eprintln!(
+            "note: resized vector index to max_elements={max_elements} via save/load (fast path)"
+        );
 
         Ok(())
     }
