@@ -100,6 +100,11 @@ struct DeleteDrawerRequest {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+struct DeleteWingRequest {
+    wing: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 struct KgQueryRequest {
     entity: String,
     as_of: Option<String>,
@@ -417,6 +422,21 @@ impl McpServer {
         } else {
             Ok(json!({"success": false, "error": format!("Drawer not found: {drawer_id}")}))
         }
+    }
+
+    pub async fn tool_delete_wing(&self, wing: String) -> Result<Value, String> {
+        let count = self
+            .app
+            .store
+            .delete_wing(&wing)
+            .await
+            .map_err(|error| error.to_string())?;
+
+        Ok(json!({
+            "success": true,
+            "wing": wing,
+            "deleted_drawers": count,
+        }))
     }
 
     pub async fn tool_kg_query(
@@ -858,6 +878,17 @@ impl McpServer {
             .map_err(internal_error)
     }
 
+    #[tool(description = "Delete an entire wing and all its drawers. Irreversible.")]
+    async fn mempalace_delete_wing(
+        &self,
+        Parameters(request): Parameters<DeleteWingRequest>,
+    ) -> McpResult {
+        self.tool_delete_wing(request.wing)
+            .await
+            .map(Json)
+            .map_err(internal_error)
+    }
+
     #[tool(description = "Query the knowledge graph for an entity's relationships.")]
     async fn mempalace_kg_query(
         &self,
@@ -1100,6 +1131,7 @@ mod tests {
                 "mempalace_add_drawer",
                 "mempalace_check_duplicate",
                 "mempalace_delete_drawer",
+                "mempalace_delete_wing",
                 "mempalace_diary_read",
                 "mempalace_diary_write",
                 "mempalace_find_tunnels",
