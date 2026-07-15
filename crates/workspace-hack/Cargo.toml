@@ -16,31 +16,25 @@ publish = false
 ### BEGIN HAKARI SECTION
 [dependencies]
 crossbeam-utils = { version = "0.8" }
-flate2 = { version = "1" }
 futures-core = { version = "0.3" }
 futures-sink = { version = "0.3" }
-getrandom = { version = "0.3", default-features = false, features = ["std", "wasm_js"] }
 hashbrown = { version = "0.16", default-features = false, features = ["default-hasher"] }
 memchr = { version = "2" }
 num-traits = { version = "0.2", default-features = false, features = ["i128", "std"] }
 once_cell = { version = "1" }
 serde = { version = "1", features = ["alloc", "derive", "rc"] }
 serde_core = { version = "1", default-features = false, features = ["alloc", "rc", "result", "std"] }
-serde_json = { version = "1", features = ["alloc"] }
-simd-adler32 = { version = "0.3", default-features = false, features = ["std"] }
+serde_json = { version = "1", features = ["alloc", "preserve_order"] }
 smallvec = { version = "1", default-features = false, features = ["const_generics"] }
 tokio = { version = "1", features = ["io-std", "io-util", "macros", "rt-multi-thread", "sync", "time"] }
-zeroize = { version = "1", features = ["zeroize_derive"] }
 
 [build-dependencies]
-flate2 = { version = "1" }
-getrandom = { version = "0.3", default-features = false, features = ["std", "wasm_js"] }
 hashbrown = { version = "0.16", default-features = false, features = ["default-hasher"] }
 memchr = { version = "2" }
+proc-macro2 = { version = "1" }
+quote = { version = "1" }
 serde_core = { version = "1", default-features = false, features = ["alloc", "rc", "result", "std"] }
-serde_json = { version = "1", features = ["alloc"] }
-simd-adler32 = { version = "0.3", default-features = false, features = ["std"] }
+serde_json = { version = "1", features = ["alloc", "preserve_order"] }
 syn = { version = "2", features = ["extra-traits", "fold", "full", "visit", "visit-mut"] }
-zeroize = { version = "1", features = ["zeroize_derive"] }
 
 ### END HAKARI SECTION
