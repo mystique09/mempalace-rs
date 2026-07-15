@@ -18,6 +18,7 @@ The Rust code currently owns:
 - the SQLite/FTS5 drawer store
 - the AAAK compression utilities
 - the SQLite knowledge graph library
+- incremental Codex/Claude session synchronization and Claude durable-memory ingestion
 
 The Rust CLI surface is intentionally smaller than the Python package. Do not document or imply Python-only commands as if they already exist in Rust.
 
@@ -27,6 +28,7 @@ The Rust CLI surface is intentionally smaller than the Python package. Do not do
 - `bin/mempalace-mcp/src/main.rs` - MCP binary entry point
 - `crates/core/src/config.rs` - config loading, default paths, and legacy Chroma handoff
 - `crates/core/src/project_miner.rs` - file scanning, chunking, room detection, and mining heuristics
+- `crates/core/src/agent_sessions.rs` - resumable agent-history discovery, filtering, and adapter orchestration
 - `crates/core/src/knowledge_graph.rs` - temporal fact graph stored in SQLite
 - `crates/core/src/aaak.rs` - AAAK dialect and compression helpers
 - `crates/store/src/lib.rs` - SQLite storage, exact-cosine/FTS5 search, and embeddings
@@ -66,6 +68,7 @@ For CLI changes, verify the relevant `--help` output. For mining, config, AAAK, 
 - Rust mining uses Tree-sitter structural chunks and stores enriched embedding text separately from verbatim drawer content. Other code uses line-aligned chunks; non-code keeps the text chunker.
 - The default embedding model is `minishlab/potion-code-16M-v2`. Stored model metadata must match the configured model; use a full `remine` to change it.
 - `remine` recomputes vectors for existing drawers but does not rechunk files. Delete and mine a wing again when adopting new structural chunking behavior.
+- Agent-session synchronization is opt-in in global config. Run the manual first backfill for each canonical source root before relying on MCP background polling; unchanged JSONL files are skipped, active files resume from complete-line checkpoints, large files are committed in bounded batches, and raw Codex/Claude logs must not be sent through the generic miner.
 - `compress` is lossy. Keep the docs and code comments explicit about that.
 - The knowledge graph exists in Rust as a library and MCP tool set even though there are no Rust CLI subcommands for it yet.
 

@@ -6,8 +6,9 @@ use std::{
 
 use chrono::Utc;
 use mempalace_core::{
-    ContentKind, Drawer, DrawerMetadata, KnowledgeGraph, MemoryStore, MempalaceConfig,
-    RetrievalContext, SearchQuery, retrieval_text_for_content,
+    AgentSessionSelection, AgentSessionSyncOptions, AgentSessionsConfig, ContentKind, Drawer,
+    DrawerMetadata, KnowledgeGraph, MemoryStore, MempalaceConfig, RetrievalContext, SearchQuery,
+    retrieval_text_for_content, sync_agent_sessions,
 };
 use mempalace_store::SqliteMemoryStore;
 use rmcp::{
@@ -57,6 +58,7 @@ struct AppContext {
     palace_root: PathBuf,
     store: SqliteMemoryStore,
     graph: KnowledgeGraph,
+    agent_sessions: AgentSessionsConfig,
 }
 
 #[derive(Default, Clone)]
@@ -194,6 +196,7 @@ impl McpServer {
         let palace_root = palace_override.unwrap_or_else(|| config.palace_path());
         let store_path = MempalaceConfig::resolve_store_path(&palace_root);
         let model_cache_path = config.model_cache_path();
+        let agent_sessions = config.agent_sessions().clone();
 
         fs::create_dir_all(&palace_root)?;
         fs::create_dir_all(&store_path)?;
@@ -208,6 +211,7 @@ impl McpServer {
                 palace_root,
                 store,
                 graph,
+                agent_sessions,
             },
             tool_router: Self::tool_router(),
         })
@@ -215,9 +219,39 @@ impl McpServer {
 
     pub async fn run_stdio() -> Result<(), Box<dyn std::error::Error>> {
         let server = Self::open().await?;
+        let background_server = server.clone();
         let service = server.serve(stdio()).await?;
+        let background = background_server.spawn_background_session_sync();
         service.waiting().await?;
+        if let Some(background) = background {
+            background.abort();
+        }
         Ok(())
+    }
+
+    fn spawn_background_session_sync(&self) -> Option<tokio::task::JoinHandle<()>> {
+        if !background_session_sync_enabled(&self.app.agent_sessions) {
+            return None;
+        }
+
+        let store = self.app.store.clone();
+        let config = self.app.agent_sessions.clone();
+        Some(tokio::spawn(async move {
+            let mut backfill_notice_emitted = false;
+            if config.sync_on_start {
+                backfill_notice_emitted =
+                    run_background_session_sync(&store, &config, backfill_notice_emitted).await;
+            }
+            if config.interval_seconds == 0 {
+                return;
+            }
+            let interval = std::time::Duration::from_secs(config.interval_seconds.max(1));
+            loop {
+                tokio::time::sleep(interval).await;
+                backfill_notice_emitted |=
+                    run_background_session_sync(&store, &config, backfill_notice_emitted).await;
+            }
+        }))
     }
 
     pub async fn tool_status(&self) -> Result<Value, String> {
@@ -833,6 +867,58 @@ impl McpServer {
     }
 }
 
+fn background_session_sync_enabled(config: &AgentSessionsConfig) -> bool {
+    config.sources.codex.enabled || config.sources.claude.enabled
+}
+
+async fn run_background_session_sync(
+    store: &SqliteMemoryStore,
+    config: &AgentSessionsConfig,
+    backfill_notice_emitted: bool,
+) -> bool {
+    match sync_agent_sessions(
+        store,
+        config,
+        AgentSessionSyncOptions {
+            selection: AgentSessionSelection::All,
+            dry_run: false,
+            allow_initial_backfill: false,
+        },
+    )
+    .await
+    {
+        Ok(report) if report.lease_contended => false,
+        Ok(report) if report.sources_needing_backfill > 0 => {
+            if !backfill_notice_emitted {
+                eprintln!(
+                    "mempalace: {} agent-session source(s) need an initial `mempalace-rs sync agent-sessions` backfill",
+                    report.sources_needing_backfill
+                );
+            }
+            true
+        }
+        Ok(report)
+            if report.drawers_written > 0
+                || report.files_reconciled > 0
+                || report.malformed_records > 0 =>
+        {
+            eprintln!(
+                "mempalace: agent-session sync wrote {} drawers ({} appended, {} reconciled, {} malformed)",
+                report.drawers_written,
+                report.files_appended,
+                report.files_reconciled,
+                report.malformed_records
+            );
+            false
+        }
+        Ok(_) => false,
+        Err(error) => {
+            eprintln!("mempalace: agent-session background sync failed: {error}");
+            false
+        }
+    }
+}
+
 #[tool_router]
 impl McpServer {
     #[tool(description = "Palace overview - total drawers, wing and room counts")]
@@ -1147,12 +1233,55 @@ fn fuzzy_match(query: &str, nodes: &BTreeMap<String, GraphNode>) -> Vec<String> 
 
 #[cfg(test)]
 mod tests {
-    use super::{GraphNode, McpServer, diary_topic, excerpt, fuzzy_match, slugify};
+    use super::{
+        GraphNode, McpServer, background_session_sync_enabled, diary_topic, excerpt, fuzzy_match,
+        slugify,
+    };
+    use mempalace_core::AgentSessionsConfig;
     use std::collections::{BTreeMap, BTreeSet};
+    use tempfile::tempdir;
 
     #[test]
     fn slugify_normalizes_agent_names() {
         assert_eq!(slugify("Codex Agent"), "codex_agent");
+    }
+
+    #[test]
+    fn background_session_sync_requires_an_enabled_source() {
+        let mut config = AgentSessionsConfig::default();
+        assert!(!background_session_sync_enabled(&config));
+
+        config.sources.codex.enabled = true;
+        assert!(background_session_sync_enabled(&config));
+    }
+
+    #[tokio::test]
+    async fn background_session_sync_runs_after_construction_and_can_finish_once() {
+        let tmp = tempdir().unwrap();
+        let palace = tmp.path().join("palace");
+        let mut server = McpServer::open_with_palace_and_model(
+            Some(palace),
+            Some(
+                tmp.path()
+                    .join("missing-model")
+                    .to_string_lossy()
+                    .to_string(),
+            ),
+        )
+        .await
+        .unwrap();
+        server.app.agent_sessions.sources.codex.enabled = true;
+        server.app.agent_sessions.sources.codex.path = Some(tmp.path().join("missing-sessions"));
+        server.app.agent_sessions.sync_on_start = true;
+        server.app.agent_sessions.interval_seconds = 0;
+
+        let task = server
+            .spawn_background_session_sync()
+            .expect("enabled source should create a background task");
+        tokio::time::timeout(std::time::Duration::from_secs(1), task)
+            .await
+            .expect("run-once background sync must not block the server")
+            .unwrap();
     }
 
     #[test]

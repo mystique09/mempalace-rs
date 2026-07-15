@@ -2,7 +2,7 @@
 
 `mempalace-rs` is the Rust workspace for MemPalace. It currently provides:
 
-- a CLI for initialization, project mining, semantic search, status inspection, and AAAK compression
+- a CLI for initialization, project mining, agent-session synchronization, semantic search, status inspection, and AAAK compression
 - a CLI `tool` namespace that mirrors the Rust MCP tool surface for skill and agent fallback
 - a SQLite drawer store with model2vec-rs (potion-code-16M-v2) embeddings
 - a SQLite knowledge graph for temporal facts
@@ -12,7 +12,7 @@ This repository is not yet a full Rust replacement for the Python package. The c
 
 ## Status
 
-- Implemented in Rust today: `init`, `status`, `mine`, `search`, `compress`, `migrate`, `remine`, the `tool <MCP_TOOL>` CLI namespace, the SQLite store, the knowledge graph library, and the MCP server.
+- Implemented in Rust today: `init`, `status`, `mine`, `sync agent-sessions`, `search`, `compress`, `migrate`, `remine`, the `tool <MCP_TOOL>` CLI namespace, the SQLite store, the knowledge graph library, and the MCP server.
 - Still missing from Rust parity: some Python-only workflows from the reference package.
 
 ## Workspace Layout
@@ -67,6 +67,13 @@ Inspect counts:
 cargo run --bin mempalace-rs -- status
 ```
 
+Synchronize configured Codex and Claude histories:
+
+```bash
+cargo run --bin mempalace-rs -- sync agent-sessions --dry-run
+cargo run --bin mempalace-rs -- sync agent-sessions
+```
+
 Preview AAAK compression output:
 
 ```bash
@@ -93,6 +100,7 @@ cargo run --bin mempalace-mcp
 | `status` | Prints total drawer count, store path, KG path, and room counts by wing |
 | `search <QUERY> [SCOPE]` | Runs content-aware hybrid semantic search with optional wing, room, score, and reference-time filters; when no explicit wing is supplied, the CLI can infer one from `SCOPE` or the current project root |
 | `mine <DIR>` | Scans text-like project files, skips common binary/media/archive formats, chunks them into drawers, and writes them into a wing |
+| `sync agent-sessions` | Incrementally imports configured Codex conversations, Claude conversations, and Claude durable memory with source-specific filtering and checkpoints |
 | `compress` | Reads stored drawers and emits lossy AAAK summaries, either to stdout (`--dry-run`) or to a generated output file |
 | `migrate` | Migrates drawers from a legacy ChromaDB SQLite database into the current SQLite store |
 | `remine` | Atomically re-embeds existing drawers with the configured model (potion-code-16M-v2 by default) |
@@ -105,6 +113,7 @@ Useful flags:
 - `init --no-onboarding` skips the interactive bootstrap flow.
 - `mine --exclude-data-files` skips noisy `.json`, `.csv`, and `.sql` files in data-heavy folders when you want a cleaner index than the Python default.
 - `mine --no-gitignore` disables `.gitignore`-aware scanning.
+- `sync agent-sessions --source <all|codex|claude>` selects an enabled agent-history source; `--dry-run` reports planned work without writing drawers or checkpoints.
 - `migrate --from <PATH>` imports drawers from a legacy ChromaDB SQLite database.
 - `search --all-wings` disables implicit wing narrowing.
 - `search --min-score <COSINE>` filters results by their original-query cosine similarity without changing fused ranking.
@@ -139,6 +148,63 @@ Environment variables:
 - `MEMPALACE_PALACE_PATH`
 - `MEMPAL_PALACE_PATH`
 
+### Agent-session synchronization
+
+Native agent history synchronization is disabled unless a source is explicitly
+enabled in `config.json`. Merge an `agent_sessions` section like this into the
+existing configuration:
+
+```json
+{
+  "agent_sessions": {
+    "sync_on_start": true,
+    "interval_seconds": 60,
+    "sources": {
+      "codex": {
+        "enabled": true,
+        "path": null,
+        "wing": "codex-sessions"
+      },
+      "claude": {
+        "enabled": true,
+        "path": null,
+        "wing": "claude-sessions",
+        "include_memory": true,
+        "memory_wing": "claude-memory"
+      }
+    }
+  }
+}
+```
+
+A null Codex path resolves to `~/.codex/sessions`; a null Claude path resolves
+to `~/.claude/projects`. Explicit paths support alternate and cross-platform
+installations. Run the manual command once for the visible historical backfill.
+The MCP server will not start a surprise first-time backfill; after checkpoints
+exist, it starts serving normally and synchronizes only new records in the
+background. Set `interval_seconds` to `0` for startup-only synchronization.
+Backfill authorization is scoped to the canonical configured root, so changing
+that path requires one new explicit manual backfill instead of silently reading
+a different history tree in the background.
+
+The adapters stream JSONL and never mine the raw event log. Codex keeps genuine
+`user_message` events plus assistant `final_answer` messages and skips subagent
+rollouts. Claude follows parent-UUID lineage from genuine prompts to
+`end_turn` assistant text and skips sidechains and subagent logs. Both exclude
+reasoning/thinking, commentary, tool calls and results, injected instructions,
+attachments, system records, and telemetry. Claude Markdown under project
+`memory/` directories is indexed separately as durable documentation;
+`~/.claude/history.jsonl` is ignored as a duplicate prompt index.
+
+Each source checkpoint stores its last complete-line byte offset and pending
+parser state. Unchanged files are skipped by metadata, appended files resume at
+that offset, and a partial final line waits for the next pass. Drawer upserts and
+checkpoint advancement share one SQLite transaction, while an expiring database
+lease prevents multiple MCP processes from performing the same sync concurrently.
+Large JSONL files are processed in bounded record/turn batches and embeddings
+are generated in bounded batches, so a historical backfill does not accumulate
+an entire extracted transcript in RAM.
+
 If the chosen palace path contains a legacy `chroma.sqlite3`, use `mempalace-rs migrate --from <path>` to import drawers into the current SQLite store.
 
 Search streams exact cosine comparisons through a bounded candidate heap and independently retrieves indexed FTS5/BM25 candidates. Every drawer persists a content kind: `code`, `conversation`, `documentation`, `diary`, `prose`, or `unknown`; legacy rows are conservatively backfilled from their wing, room, and source path when possible. Unrecognized and manually filed `unknown` content stays neutral instead of receiving code-only treatment. The original dense query remains shared across all kinds, while bounded code query views apply only to explicit code candidates and scaffold-stripped recall views apply to all non-code candidates. Candidate-aware reranking scopes identifier/path evidence to code, heading/path evidence to documentation, role-labelled retrieval text to conversations, and reliable reference-time evidence to dated memories. Weighted reciprocal-rank fusion combines the channels without a process-local HNSW index. Results expose fused `relevance` for ordering and original-query cosine `similarity` for duplicate thresholds.
@@ -151,6 +217,7 @@ The Rust miner keeps source content verbatim while preparing a separate enriched
 
 - It mines text-like files by default, including unknown extensions and extensionless source files, while skipping common binary, media, archive, and document formats such as `.swf`, `.fla`, `.png`, `.pdf`, and `.zip`.
 - It skips common build and cache directories such as `.git`, `node_modules`, `.venv`, `.next`, `coverage`, and `target`.
+- Native Codex and Claude JSONL histories should use `sync agent-sessions`, not the generic project miner; the adapters intentionally remove machine-generated event noise before embedding.
 - It always skips the checked-in `multi_domain_queries.json` evaluator corpus so ground-truth queries and labels cannot leak into production retrieval text.
 - By default it matches the Python miner and includes readable data files in places like `assets/`, `migrations/`, `fixtures/`, and `seed/`.
 - `mine --exclude-data-files` restores the Rust-only cleaner-index behavior by skipping noisy `.json`, `.csv`, and `.sql` files in those folders.
@@ -176,6 +243,10 @@ The same Rust implementation is also available through the CLI as `mempalace-rs 
 `mempalace_search` accepts optional `wing`, `room`, and `as_of` fields and returns each result's `content_kind`. `mempalace_add_drawer` accepts an optional `content_kind`; `mempalace_diary_write` always stores `diary`.
 
 `mempalace_status` also returns the embedded memory protocol and AAAK dialect guidance so an MCP client can learn the expected usage pattern on connect.
+
+When one or more agent-session sources are enabled, the MCP process starts its
+incremental sync task only after the stdio service is ready. Synchronization
+uses stderr for diagnostics so stdout remains a valid MCP transport.
 
 ## Development
 

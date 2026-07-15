@@ -617,7 +617,7 @@ fn sanitize_room(room: &str) -> String {
     room.trim().replace(' ', "_").to_lowercase()
 }
 
-fn chunk_text(content: &str) -> Vec<String> {
+pub(crate) fn chunk_text(content: &str) -> Vec<String> {
     let content = content.trim();
     if content.is_empty() {
         return Vec::new();

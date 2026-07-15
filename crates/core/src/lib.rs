@@ -1,4 +1,5 @@
 pub mod aaak;
+pub mod agent_sessions;
 pub mod config;
 pub mod entity_detector;
 pub mod error;
@@ -9,7 +10,15 @@ pub mod project_miner;
 pub use aaak::{
     AaakCompressionStats, AaakDecoded, AaakDialect, AaakFile, AaakHeader, AaakTunnel, AaakZettel,
 };
-pub use config::{DEFAULT_COLLECTION_NAME, DEFAULT_PALACE_PATH_SUFFIX, MempalaceConfig};
+pub use agent_sessions::{
+    AgentSessionCheckpoint, AgentSessionCommit, AgentSessionSelection, AgentSessionStore,
+    AgentSessionSyncOptions, AgentSessionSyncReport, sync_agent_sessions,
+    sync_agent_sessions_with_progress,
+};
+pub use config::{
+    AgentSessionSourcesConfig, AgentSessionsConfig, ClaudeSessionSourceConfig,
+    CodexSessionSourceConfig, DEFAULT_COLLECTION_NAME, DEFAULT_PALACE_PATH_SUFFIX, MempalaceConfig,
+};
 pub use entity_detector::{
     DetectedEntities, DetectedEntity, DetectedEntityKind, detect_entities, scan_for_detection,
 };

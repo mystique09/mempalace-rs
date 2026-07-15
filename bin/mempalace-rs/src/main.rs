@@ -5,11 +5,11 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use mempalace_core::{
-    AaakDialect, ContentKind, DetectedEntities, Drawer, DrawerMetadata, KnowledgeGraph,
-    MemoryStore, MempalaceConfig, MineOptions, SearchQuery, detect_entities, mine_project,
-    scan_for_detection,
+    AaakDialect, AgentSessionSelection, AgentSessionSyncOptions, ContentKind, DetectedEntities,
+    Drawer, DrawerMetadata, KnowledgeGraph, MemoryStore, MempalaceConfig, MineOptions, SearchQuery,
+    detect_entities, mine_project, scan_for_detection, sync_agent_sessions_with_progress,
 };
 use mempalace_mcp::McpServer;
 use mempalace_store::SqliteMemoryStore;
@@ -103,9 +103,40 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+    Sync {
+        #[command(subcommand)]
+        command: SyncCommand,
+    },
     Tool {
         #[command(subcommand)]
         command: ToolCommand,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum AgentSessionSourceArg {
+    All,
+    Codex,
+    Claude,
+}
+
+impl From<AgentSessionSourceArg> for AgentSessionSelection {
+    fn from(value: AgentSessionSourceArg) -> Self {
+        match value {
+            AgentSessionSourceArg::All => Self::All,
+            AgentSessionSourceArg::Codex => Self::Codex,
+            AgentSessionSourceArg::Claude => Self::Claude,
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
+enum SyncCommand {
+    AgentSessions {
+        #[arg(long, value_enum, default_value = "all")]
+        source: AgentSessionSourceArg,
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -433,12 +464,62 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let app = open_context(cli.palace, cli.model.as_deref()).await?;
             run_migrate(&app, from_path, dry_run).await?;
         }
+        Command::Sync { command } => {
+            let app = open_context(cli.palace, cli.model.as_deref()).await?;
+            run_sync_command(&app, command).await?;
+        }
         Command::Tool { command } => {
             let server = McpServer::open_with_palace_and_model(cli.palace, cli.model).await?;
             run_tool_command(&server, command).await?;
         }
     }
 
+    Ok(())
+}
+
+async fn run_sync_command(
+    app: &AppContext,
+    command: SyncCommand,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match command {
+        SyncCommand::AgentSessions { source, dry_run } => {
+            let report = sync_agent_sessions_with_progress(
+                &app.store,
+                app.config.agent_sessions(),
+                AgentSessionSyncOptions {
+                    selection: source.into(),
+                    dry_run,
+                    allow_initial_backfill: true,
+                },
+            )
+            .await?;
+            println!(
+                "Agent-session sync{}",
+                if dry_run { " (dry run)" } else { "" }
+            );
+            if report.lease_contended {
+                println!("  skipped: another MemPalace process owns the sync lease");
+                return Ok(());
+            }
+            println!("  files seen:       {}", report.files_seen);
+            println!("  files unchanged:  {}", report.files_skipped);
+            println!("  files appended:   {}", report.files_appended);
+            println!("  files reconciled: {}", report.files_reconciled);
+            println!("  drawers written:  {}", report.drawers_written);
+            if report.sources_missing > 0 {
+                println!("  sources missing:  {}", report.sources_missing);
+            }
+            if report.sources_needing_backfill > 0 {
+                println!(
+                    "  sources needing initial backfill: {}",
+                    report.sources_needing_backfill
+                );
+            }
+            if report.malformed_records > 0 {
+                println!("  malformed records skipped: {}", report.malformed_records);
+            }
+        }
+    }
     Ok(())
 }
 
@@ -2130,10 +2211,10 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        Cli, Command, OnboardingPerson, ToolCommand, infer_import_content_kind,
-        infer_wing_from_scope, looks_like_project_root, resolve_search_wing,
-        run_project_entity_detection, write_aaak_bootstrap, write_entity_registry,
-        write_project_config_scaffold,
+        AgentSessionSourceArg, Cli, Command, OnboardingPerson, SyncCommand, ToolCommand,
+        infer_import_content_kind, infer_wing_from_scope, looks_like_project_root,
+        resolve_search_wing, run_project_entity_detection, write_aaak_bootstrap,
+        write_entity_registry, write_project_config_scaffold,
     };
     use clap::Parser;
 
@@ -2171,6 +2252,29 @@ mod tests {
         let cli = Cli::try_parse_from(["mempalace-rs", "init", "."]).unwrap();
         match cli.command {
             Command::Init { dir, .. } => assert_eq!(dir, Some(".".into())),
+            command => panic!("unexpected command parsed: {command:?}"),
+        }
+    }
+
+    #[test]
+    fn sync_agent_sessions_accepts_source_and_dry_run() {
+        let cli = Cli::try_parse_from([
+            "mempalace-rs",
+            "sync",
+            "agent-sessions",
+            "--source",
+            "claude",
+            "--dry-run",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Command::Sync {
+                command: SyncCommand::AgentSessions { source, dry_run },
+            } => {
+                assert_eq!(source, AgentSessionSourceArg::Claude);
+                assert!(dry_run);
+            }
             command => panic!("unexpected command parsed: {command:?}"),
         }
     }

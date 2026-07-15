@@ -28,6 +28,9 @@ pub enum MempalaceError {
     #[error("embedding error: {0}")]
     Embedding(String),
 
+    #[error("agent-session sync error: {0}")]
+    AgentSessionSync(String),
+
     #[error("lock poisoned: {0}")]
     LockPoisoned(&'static str),
 

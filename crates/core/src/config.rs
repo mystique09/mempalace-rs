@@ -14,6 +14,100 @@ use crate::{
 pub const DEFAULT_COLLECTION_NAME: &str = "mempalace_drawers";
 pub const DEFAULT_PALACE_PATH_SUFFIX: &str = ".mempalace/palace";
 
+fn default_true() -> bool {
+    true
+}
+
+fn default_sync_interval_seconds() -> u64 {
+    60
+}
+
+fn default_codex_wing() -> String {
+    "codex-sessions".to_owned()
+}
+
+fn default_claude_wing() -> String {
+    "claude-sessions".to_owned()
+}
+
+fn default_claude_memory_wing() -> String {
+    "claude-memory".to_owned()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CodexSessionSourceConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub path: Option<PathBuf>,
+    #[serde(default = "default_codex_wing")]
+    pub wing: String,
+}
+
+impl Default for CodexSessionSourceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            path: None,
+            wing: default_codex_wing(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClaudeSessionSourceConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub path: Option<PathBuf>,
+    #[serde(default = "default_claude_wing")]
+    pub wing: String,
+    #[serde(default = "default_true")]
+    pub include_memory: bool,
+    #[serde(default = "default_claude_memory_wing")]
+    pub memory_wing: String,
+}
+
+impl Default for ClaudeSessionSourceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            path: None,
+            wing: default_claude_wing(),
+            include_memory: true,
+            memory_wing: default_claude_memory_wing(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AgentSessionSourcesConfig {
+    #[serde(default)]
+    pub codex: CodexSessionSourceConfig,
+    #[serde(default)]
+    pub claude: ClaudeSessionSourceConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentSessionsConfig {
+    #[serde(default = "default_true")]
+    pub sync_on_start: bool,
+    #[serde(default = "default_sync_interval_seconds")]
+    pub interval_seconds: u64,
+    #[serde(default)]
+    pub sources: AgentSessionSourcesConfig,
+}
+
+impl Default for AgentSessionsConfig {
+    fn default() -> Self {
+        Self {
+            sync_on_start: true,
+            interval_seconds: default_sync_interval_seconds(),
+            sources: AgentSessionSourcesConfig::default(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct FileConfig {
     #[serde(default)]
@@ -28,6 +122,8 @@ struct FileConfig {
     projects: Vec<String>,
     #[serde(default)]
     people_map: BTreeMap<String, String>,
+    #[serde(default)]
+    agent_sessions: AgentSessionsConfig,
 }
 
 #[derive(Debug, Clone)]
@@ -118,6 +214,10 @@ impl MempalaceConfig {
         &self.file_config.people_map
     }
 
+    pub fn agent_sessions(&self) -> &AgentSessionsConfig {
+        &self.file_config.agent_sessions
+    }
+
     pub fn knowledge_graph_path(&self) -> PathBuf {
         self.config_dir.join(DEFAULT_KG_FILENAME)
     }
@@ -153,6 +253,7 @@ impl MempalaceConfig {
                 topic_wings: Vec::new(),
                 projects: Vec::new(),
                 people_map: BTreeMap::new(),
+                agent_sessions: AgentSessionsConfig::default(),
             };
 
             let raw = serde_json::to_string_pretty(&default_config)?;
@@ -316,5 +417,67 @@ mod tests {
         assert_eq!(loaded.mode(), Some("combo"));
         assert_eq!(loaded.topic_wings(), ["family", "projects"]);
         assert_eq!(loaded.projects(), ["mempalace-rs"]);
+    }
+
+    #[test]
+    fn legacy_config_keeps_agent_session_sources_disabled() {
+        let tmp = tempdir().unwrap();
+        let config_dir = tmp.path().join(".mempalace");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(config_dir.join("config.json"), r#"{"mode":"combo"}"#).unwrap();
+
+        let loaded = MempalaceConfig::load_with_dir(config_dir).unwrap();
+        let sessions = loaded.agent_sessions();
+
+        assert!(sessions.sync_on_start);
+        assert_eq!(sessions.interval_seconds, 60);
+        assert!(!sessions.sources.codex.enabled);
+        assert!(!sessions.sources.claude.enabled);
+    }
+
+    #[test]
+    fn configured_agent_session_sources_round_trip() {
+        let tmp = tempdir().unwrap();
+        let config_dir = tmp.path().join(".mempalace");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(
+            config_dir.join("config.json"),
+            r#"{
+              "agent_sessions": {
+                "sync_on_start": false,
+                "interval_seconds": 30,
+                "sources": {
+                  "codex": {
+                    "enabled": true,
+                    "path": "/tmp/codex-sessions",
+                    "wing": "codex-history"
+                  },
+                  "claude": {
+                    "enabled": true,
+                    "path": "/tmp/claude-projects",
+                    "wing": "claude-history",
+                    "include_memory": true,
+                    "memory_wing": "claude-notes"
+                  }
+                }
+              }
+            }"#,
+        )
+        .unwrap();
+
+        let loaded = MempalaceConfig::load_with_dir(config_dir).unwrap();
+        let sessions = loaded.agent_sessions();
+
+        assert!(!sessions.sync_on_start);
+        assert_eq!(sessions.interval_seconds, 30);
+        assert!(sessions.sources.codex.enabled);
+        assert_eq!(
+            sessions.sources.codex.path.as_deref(),
+            Some(std::path::Path::new("/tmp/codex-sessions"))
+        );
+        assert_eq!(sessions.sources.codex.wing, "codex-history");
+        assert!(sessions.sources.claude.enabled);
+        assert!(sessions.sources.claude.include_memory);
+        assert_eq!(sessions.sources.claude.memory_wing, "claude-notes");
     }
 }

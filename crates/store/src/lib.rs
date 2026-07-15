@@ -14,8 +14,9 @@ use model2vec_rs::model::StaticModel;
 use rusqlite::{Connection, params};
 
 use mempalace_core::{
-    ContentKind, Drawer, DrawerMetadata, MemoryStore, MempalaceError, Result, RoomStatus,
-    SearchHit, SearchQuery, StoreStatus,
+    AgentSessionCheckpoint, AgentSessionCommit, AgentSessionStore, ContentKind, Drawer,
+    DrawerMetadata, MemoryStore, MempalaceError, Result, RoomStatus, SearchHit, SearchQuery,
+    StoreStatus,
 };
 
 const DEFAULT_MODEL_REPO: &str = "minishlab/potion-code-16M-v2";
@@ -24,6 +25,7 @@ const EMBEDDING_MODEL_KEY: &str = "embedding_model";
 const EMBEDDING_REPRESENTATION_KEY: &str = "embedding_representation";
 const CURRENT_EMBEDDING_REPRESENTATION: &str = "content-kind-v3";
 const RRF_K: usize = 60;
+const AGENT_SESSION_EMBEDDING_BATCH_SIZE: usize = 64;
 
 /// Schema DDL for the SQLite store.
 const SCHEMA_DDL: &str = "
@@ -44,6 +46,33 @@ CREATE TABLE IF NOT EXISTS drawers (
 CREATE TABLE IF NOT EXISTS store_metadata (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS agent_session_sync_state (
+    adapter        TEXT NOT NULL,
+    source_key     TEXT NOT NULL,
+    source_path    TEXT NOT NULL,
+    file_size      INTEGER NOT NULL,
+    modified_ns    INTEGER NOT NULL,
+    byte_offset    INTEGER NOT NULL,
+    fingerprint    TEXT NOT NULL,
+    parser_version INTEGER NOT NULL,
+    cursor_json    TEXT NOT NULL,
+    updated_at     TEXT NOT NULL,
+    PRIMARY KEY (adapter, source_key)
+);
+
+CREATE TABLE IF NOT EXISTS agent_session_sync_leases (
+    lease_name     TEXT PRIMARY KEY,
+    owner          TEXT NOT NULL,
+    expires_at_ms  INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS agent_session_sync_roots (
+    adapter        TEXT NOT NULL,
+    root_path      TEXT NOT NULL,
+    initialized_at TEXT NOT NULL,
+    PRIMARY KEY (adapter, root_path)
 );
 
 CREATE VIRTUAL TABLE IF NOT EXISTS drawers_fts USING fts5(
@@ -920,6 +949,224 @@ impl MemoryStore for SqliteMemoryStore {
                 .collect();
 
             Ok(rows)
+        })
+    }
+}
+
+#[async_trait]
+impl AgentSessionStore for SqliteMemoryStore {
+    async fn agent_session_checkpoint(
+        &self,
+        adapter: &str,
+        source_key: &str,
+    ) -> Result<Option<AgentSessionCheckpoint>> {
+        self.with_conn(|conn| {
+            let mut statement = conn.prepare(
+                "SELECT adapter, source_key, source_path, file_size, modified_ns,
+                        byte_offset, fingerprint, parser_version, cursor_json, updated_at
+                 FROM agent_session_sync_state
+                 WHERE adapter = ?1 AND source_key = ?2",
+            )?;
+            match statement.query_row(params![adapter, source_key], |row| {
+                Ok(AgentSessionCheckpoint {
+                    adapter: row.get(0)?,
+                    source_key: row.get(1)?,
+                    source_path: row.get(2)?,
+                    file_size: row.get::<_, i64>(3)?.max(0) as u64,
+                    modified_ns: row.get(4)?,
+                    byte_offset: row.get::<_, i64>(5)?.max(0) as u64,
+                    fingerprint: row.get(6)?,
+                    parser_version: row.get::<_, i64>(7)?.max(0) as u32,
+                    cursor_json: row.get(8)?,
+                    updated_at: row.get(9)?,
+                })
+            }) {
+                Ok(checkpoint) => Ok(Some(checkpoint)),
+                Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+                Err(error) => Err(error.into()),
+            }
+        })
+    }
+
+    async fn agent_session_root_initialized(&self, adapter: &str, root: &str) -> Result<bool> {
+        self.with_conn(|conn| {
+            let count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM agent_session_sync_roots
+                 WHERE adapter = ?1 AND root_path = ?2",
+                params![adapter, root],
+                |row| row.get(0),
+            )?;
+            Ok(count > 0)
+        })
+    }
+
+    async fn mark_agent_session_root_initialized(&self, adapter: &str, root: &str) -> Result<()> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO agent_session_sync_roots(adapter, root_path, initialized_at)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(adapter, root_path) DO UPDATE SET
+                    initialized_at = excluded.initialized_at",
+                params![adapter, root, chrono::Utc::now().to_rfc3339()],
+            )?;
+            Ok(())
+        })
+    }
+
+    async fn commit_agent_session_sync(&self, commit: AgentSessionCommit) -> Result<usize> {
+        self.with_conn(|conn| self.ensure_embedding_metadata(conn, true))?;
+        let texts = commit
+            .drawers
+            .iter()
+            .map(|drawer| {
+                embedding_input(
+                    &drawer.content,
+                    drawer.retrieval_text.as_deref(),
+                    drawer.metadata.source_file.as_deref(),
+                    drawer.metadata.content_kind,
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut vectors = Vec::with_capacity(texts.len());
+        for batch in texts.chunks(AGENT_SESSION_EMBEDDING_BATCH_SIZE) {
+            vectors.extend(self.embedder.embed_batch(batch)?);
+        }
+        let written = commit.drawers.len();
+
+        self.with_conn(|conn| {
+            let transaction = conn.unchecked_transaction()?;
+            if commit.replace_source {
+                let previous_source = match transaction.query_row(
+                    "SELECT source_path FROM agent_session_sync_state
+                     WHERE adapter = ?1 AND source_key = ?2",
+                    params![commit.checkpoint.adapter, commit.checkpoint.source_key],
+                    |row| row.get::<_, String>(0),
+                ) {
+                    Ok(source) => Some(source),
+                    Err(rusqlite::Error::QueryReturnedNoRows) => None,
+                    Err(error) => return Err(error.into()),
+                };
+                if let Some(previous_source) = previous_source
+                    && previous_source != commit.checkpoint.source_path
+                {
+                    transaction.execute(
+                        "DELETE FROM drawers WHERE source_file = ?1",
+                        params![previous_source],
+                    )?;
+                }
+                transaction.execute(
+                    "DELETE FROM drawers WHERE source_file = ?1",
+                    params![commit.checkpoint.source_path],
+                )?;
+            }
+            for (drawer, vector) in commit.drawers.iter().zip(vectors.iter()) {
+                transaction.execute(
+                    "INSERT INTO drawers
+                        (id, content, retrieval_text, content_kind, wing, room, source_file,
+                         chunk_index, added_by, filed_at, embedding)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                     ON CONFLICT(id) DO UPDATE SET
+                        content = excluded.content,
+                        retrieval_text = excluded.retrieval_text,
+                        content_kind = excluded.content_kind,
+                        wing = excluded.wing,
+                        room = excluded.room,
+                        source_file = excluded.source_file,
+                        chunk_index = excluded.chunk_index,
+                        added_by = excluded.added_by,
+                        filed_at = excluded.filed_at,
+                        embedding = excluded.embedding",
+                    params![
+                        drawer.id,
+                        drawer.content,
+                        drawer.retrieval_text,
+                        drawer.metadata.content_kind.to_string(),
+                        drawer.metadata.wing,
+                        drawer.metadata.room,
+                        drawer.metadata.source_file,
+                        drawer.metadata.chunk_index,
+                        drawer.metadata.added_by,
+                        drawer.metadata.filed_at,
+                        vector_to_blob(vector),
+                    ],
+                )?;
+            }
+            let checkpoint = &commit.checkpoint;
+            transaction.execute(
+                "INSERT INTO agent_session_sync_state
+                    (adapter, source_key, source_path, file_size, modified_ns, byte_offset,
+                     fingerprint, parser_version, cursor_json, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                 ON CONFLICT(adapter, source_key) DO UPDATE SET
+                    source_path = excluded.source_path,
+                    file_size = excluded.file_size,
+                    modified_ns = excluded.modified_ns,
+                    byte_offset = excluded.byte_offset,
+                    fingerprint = excluded.fingerprint,
+                    parser_version = excluded.parser_version,
+                    cursor_json = excluded.cursor_json,
+                    updated_at = excluded.updated_at",
+                params![
+                    checkpoint.adapter,
+                    checkpoint.source_key,
+                    checkpoint.source_path,
+                    checkpoint.file_size as i64,
+                    checkpoint.modified_ns,
+                    checkpoint.byte_offset as i64,
+                    checkpoint.fingerprint,
+                    checkpoint.parser_version as i64,
+                    checkpoint.cursor_json,
+                    checkpoint.updated_at,
+                ],
+            )?;
+            transaction.commit()?;
+            Ok(())
+        })?;
+
+        Ok(written)
+    }
+
+    async fn try_acquire_agent_session_lease(
+        &self,
+        owner: &str,
+        now_ms: i64,
+        expires_at_ms: i64,
+    ) -> Result<bool> {
+        self.with_conn(|conn| {
+            let changed = conn.execute(
+                "INSERT INTO agent_session_sync_leases(lease_name, owner, expires_at_ms)
+                 VALUES ('agent-sessions', ?1, ?2)
+                 ON CONFLICT(lease_name) DO UPDATE SET
+                    owner = excluded.owner,
+                    expires_at_ms = excluded.expires_at_ms
+                 WHERE agent_session_sync_leases.owner = excluded.owner
+                    OR agent_session_sync_leases.expires_at_ms < ?3",
+                params![owner, expires_at_ms, now_ms],
+            )?;
+            Ok(changed > 0)
+        })
+    }
+
+    async fn renew_agent_session_lease(&self, owner: &str, expires_at_ms: i64) -> Result<bool> {
+        self.with_conn(|conn| {
+            let changed = conn.execute(
+                "UPDATE agent_session_sync_leases
+                 SET expires_at_ms = ?2
+                 WHERE lease_name = 'agent-sessions' AND owner = ?1",
+                params![owner, expires_at_ms],
+            )?;
+            Ok(changed > 0)
+        })
+    }
+
+    async fn release_agent_session_lease(&self, owner: &str) -> Result<()> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "DELETE FROM agent_session_sync_leases
+                 WHERE lease_name = 'agent-sessions' AND owner = ?1",
+                params![owner],
+            )?;
+            Ok(())
         })
     }
 }
@@ -2052,6 +2299,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
+        AgentSessionCheckpoint, AgentSessionCommit, AgentSessionStore,
         CURRENT_EMBEDDING_REPRESENTATION, ContentKind, Drawer, DrawerMetadata,
         EMBEDDING_REPRESENTATION_KEY, MemoryStore, SearchHit, SearchQuery, SqliteMemoryStore,
         embedding_input, fts_ranked_candidates, identifier_tokens, identifier_variants,
@@ -2454,6 +2702,213 @@ mod tests {
         assert_eq!(source_files.len(), 2);
         assert!(source_files.contains("drawer_1.txt"));
         assert!(source_files.contains("drawer_2.txt"));
+    }
+
+    #[tokio::test]
+    async fn agent_session_commit_upserts_drawers_and_checkpoint_idempotently() {
+        let tmp = tempdir().unwrap();
+        let store = SqliteMemoryStore::new_for_tests(tmp.path());
+        let source_path = "/tmp/session.jsonl";
+        let mut session_drawer = drawer(
+            "drawer_session_stable",
+            "user: first\nassistant: answer",
+            "codex-sessions",
+            "demo",
+        );
+        session_drawer.metadata.content_kind = ContentKind::Conversation;
+        session_drawer.metadata.source_file = Some(source_path.to_owned());
+        let checkpoint = AgentSessionCheckpoint {
+            adapter: "codex".to_owned(),
+            source_key: "session-1".to_owned(),
+            source_path: source_path.to_owned(),
+            file_size: 100,
+            modified_ns: 200,
+            byte_offset: 100,
+            fingerprint: "abc".to_owned(),
+            parser_version: 1,
+            cursor_json: "{}".to_owned(),
+            updated_at: "2026-07-15T00:00:00Z".to_owned(),
+        };
+
+        store
+            .commit_agent_session_sync(AgentSessionCommit {
+                checkpoint: checkpoint.clone(),
+                drawers: vec![session_drawer.clone()],
+                replace_source: true,
+            })
+            .await
+            .unwrap();
+        session_drawer.content = "user: first\nassistant: corrected answer".to_owned();
+        store
+            .commit_agent_session_sync(AgentSessionCommit {
+                checkpoint: checkpoint.clone(),
+                drawers: vec![session_drawer],
+                replace_source: false,
+            })
+            .await
+            .unwrap();
+
+        let drawers = store.list_drawers(Some("codex-sessions")).await.unwrap();
+        assert_eq!(drawers.len(), 1);
+        assert!(drawers[0].content.contains("corrected answer"));
+        assert_eq!(
+            store
+                .agent_session_checkpoint("codex", "session-1")
+                .await
+                .unwrap(),
+            Some(checkpoint)
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_agent_session_drawer_write_does_not_advance_checkpoint() {
+        let tmp = tempdir().unwrap();
+        let store = SqliteMemoryStore::new_for_tests(tmp.path());
+        store
+            .with_conn(|conn| {
+                conn.execute_batch(
+                    "CREATE TRIGGER fail_agent_session_drawer
+                     BEFORE INSERT ON drawers
+                     BEGIN
+                         SELECT RAISE(ABORT, 'forced drawer failure');
+                     END;",
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let mut session_drawer = drawer(
+            "drawer_session_failure",
+            "user: question\nassistant: answer",
+            "codex-sessions",
+            "demo",
+        );
+        session_drawer.metadata.content_kind = ContentKind::Conversation;
+        session_drawer.metadata.source_file = Some("/tmp/failure.jsonl".to_owned());
+        let checkpoint = AgentSessionCheckpoint {
+            adapter: "codex".to_owned(),
+            source_key: "failure-session".to_owned(),
+            source_path: "/tmp/failure.jsonl".to_owned(),
+            file_size: 100,
+            modified_ns: 200,
+            byte_offset: 100,
+            fingerprint: "abc".to_owned(),
+            parser_version: 1,
+            cursor_json: "{}".to_owned(),
+            updated_at: "2026-07-15T00:00:00Z".to_owned(),
+        };
+
+        assert!(
+            store
+                .commit_agent_session_sync(AgentSessionCommit {
+                    checkpoint,
+                    drawers: vec![session_drawer],
+                    replace_source: true,
+                })
+                .await
+                .is_err()
+        );
+        assert!(
+            store
+                .list_drawers(Some("codex-sessions"))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .agent_session_checkpoint("codex", "failure-session")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_session_root_initialization_is_scoped_by_adapter_and_path() {
+        let tmp = tempdir().unwrap();
+        let store = SqliteMemoryStore::new_for_tests(tmp.path());
+
+        assert!(
+            !store
+                .agent_session_root_initialized("codex", "/tmp/one")
+                .await
+                .unwrap()
+        );
+        store
+            .mark_agent_session_root_initialized("codex", "/tmp/one")
+            .await
+            .unwrap();
+
+        assert!(
+            store
+                .agent_session_root_initialized("codex", "/tmp/one")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .agent_session_root_initialized("codex", "/tmp/two")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .agent_session_root_initialized("claude", "/tmp/one")
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_session_lease_excludes_other_owners_until_expiry() {
+        let tmp = tempdir().unwrap();
+        let first = SqliteMemoryStore::new_for_tests(tmp.path());
+        let second = SqliteMemoryStore::new_for_tests(tmp.path());
+
+        assert!(
+            first
+                .try_acquire_agent_session_lease("owner-a", 100, 200)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !second
+                .try_acquire_agent_session_lease("owner-b", 150, 250)
+                .await
+                .unwrap()
+        );
+        assert!(
+            first
+                .renew_agent_session_lease("owner-a", 400)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !second
+                .try_acquire_agent_session_lease("owner-b", 201, 300)
+                .await
+                .unwrap()
+        );
+        assert!(
+            second
+                .try_acquire_agent_session_lease("owner-b", 401, 500)
+                .await
+                .unwrap()
+        );
+        first.release_agent_session_lease("owner-a").await.unwrap();
+        assert!(
+            !first
+                .try_acquire_agent_session_lease("owner-a", 250, 350)
+                .await
+                .unwrap()
+        );
+        second.release_agent_session_lease("owner-b").await.unwrap();
+        assert!(
+            first
+                .try_acquire_agent_session_lease("owner-a", 250, 350)
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]
