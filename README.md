@@ -182,6 +182,25 @@ cargo test --workspace
 cargo run --bin mempalace-rs -- --help
 ```
 
+The Rust LongMemEval adapter exercises the real SQLite store and embedding
+model in an isolated temporary palace. It streams the 500-question dataset,
+stores one drawer per conversation session using the same user-turn-only raw
+mode as the Python benchmark, and can write auditable per-question JSONL:
+
+```bash
+curl -fsSL -o /tmp/longmemeval_s_cleaned.json \
+  https://huggingface.co/datasets/xiaowu0162/longmemeval-cleaned/resolve/main/longmemeval_s_cleaned.json
+cargo run --release -p mempalace-rs --example longmemeval -- \
+  /tmp/longmemeval_s_cleaned.json \
+  --output /tmp/mempalace-rs-longmemeval.jsonl
+```
+
+Use `--limit 20` for a smoke run. The benchmark never reads or writes the
+configured live palace; it only reuses the configured model cache.
+It reports p50/p95 per-question latency. On macOS, build the example first and
+wrap `target/release/examples/longmemeval ...` with `/usr/bin/time -l` to
+capture peak resident memory without including compilation.
+
 Keep these distinctions in mind:
 
 - The Rust workspace lives in `bin/` and `crates/`.

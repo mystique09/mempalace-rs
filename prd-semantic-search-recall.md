@@ -55,3 +55,24 @@ An isolated full Reforged mine produced 24,119 drawers from 2,509 files in 33.47
 - `process a player's very first game login` returns `GameCommands::FirstJoin` at rank 1 and the socket `XtRequest::FirstJoin` branch at rank 10, improved from ranks 139 and 929 respectively.
 - The five-result query completes in approximately 0.10 seconds with warm filesystem caches; a cold-process run completed in 0.75 seconds. Peak RSS was approximately 236 MB.
 - The exact query `login` continues to rank the direct `UserLogin` DTO first.
+
+### LongMemEval baseline
+
+The checked-in Rust benchmark adapter was run against all 500 questions in
+`longmemeval_s_cleaned.json` using raw session granularity, user turns only,
+the default `minishlab/potion-code-16M-v2` model, and the production SQLite
+hybrid search path:
+
+- Recall@5: 91.6%
+- Recall@10: 95.6%
+- NDCG@10: 83.0%
+- MRR@10: 79.8%
+- Runtime: 6.9 seconds total in a release build
+- Per-question latency: 12 ms p50 and 15 ms p95
+- Peak RSS: approximately 173 MB
+
+The original Python raw ChromaDB benchmark reports 96.6% Recall@5, 98.2%
+Recall@10, and 88.9% NDCG@10 on the same dataset and granularity. The Rust
+implementation is therefore 5.0 percentage points behind the original at
+Recall@5; product-level benchmark parity is not yet achieved despite the
+large improvement in Reforged code retrieval.
