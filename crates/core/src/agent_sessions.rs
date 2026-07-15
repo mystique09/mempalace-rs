@@ -936,12 +936,12 @@ fn ingest_claude_record(
     let genuine_user = record_type == Some("user")
         && message.get("role").and_then(Value::as_str) == Some("user")
         && record.get("isMeta").and_then(Value::as_bool) != Some(true)
-        && !record
+        && record
             .get("toolUseResult")
-            .is_some_and(|result| !result.is_null())
-        && !record
+            .is_none_or(|result| result.is_null())
+        && record
             .get("sourceToolAssistantUUID")
-            .is_some_and(|source| !source.is_null());
+            .is_none_or(|source| source.is_null());
 
     if genuine_user {
         if let (Some(uuid), Some(text)) = (uuid, claude_message_text(message)) {
