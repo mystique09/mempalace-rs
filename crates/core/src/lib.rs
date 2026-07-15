@@ -18,6 +18,10 @@ pub use knowledge_graph::{
     EntityRecord, FactRecord, KnowledgeGraph, KnowledgeGraphStats, RelationshipRecord,
 };
 pub use memory::{
-    Drawer, DrawerMetadata, MemoryStore, RoomStatus, SearchHit, SearchQuery, StoreStatus,
+    ContentKind, Drawer, DrawerMetadata, MemoryStore, RoomStatus, SearchHit, SearchQuery,
+    StoreStatus,
 };
-pub use project_miner::{MineOptions, MineSummary, mine_project, scan_project};
+pub use project_miner::{
+    MineOptions, MineSummary, RetrievalContext, mine_project, retrieval_text_for_content,
+    scan_project,
+};

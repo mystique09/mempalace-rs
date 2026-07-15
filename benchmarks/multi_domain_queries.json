@@ -1,0 +1,913 @@
+{
+  "documents": [
+    {
+      "id": "code-reforged-first-join",
+      "domain": "code-reforged",
+      "content_kind": "code",
+      "wing": "reforged",
+      "room": "crates",
+      "source_file": "crates/emulator/src/game/systems/player/uotls_processor.rs",
+      "content": "match request { XtRequest::FirstJoin(message) => game_commands.first_join(player, message).await?, _ => {} }",
+      "queries": [
+        {
+          "id": "crfj-01",
+          "text": "process a player's very first game login",
+          "split": "dev"
+        },
+        {
+          "id": "crfj-02",
+          "text": "where is the FirstJoin request dispatched",
+          "split": "held_out"
+        },
+        {
+          "id": "crfj-03",
+          "text": "handle an initial player connection",
+          "split": "held_out"
+        },
+        {
+          "id": "crfj-04",
+          "text": "XtRequest FirstJoin branch",
+          "split": "held_out"
+        }
+      ],
+      "target_matcher": {
+        "relative_path": "crates/emulator/src/game/systems/player/uotls_processor.rs",
+        "content_contains": [
+          "XtRequest::FirstJoin"
+        ]
+      }
+    },
+    {
+      "id": "code-reforged-position",
+      "domain": "code-reforged",
+      "content_kind": "code",
+      "wing": "reforged",
+      "room": "crates",
+      "source_file": "crates/emulator/src/game/systems/player/update_position.rs",
+      "content": "for event in update_position_reader.read() { let player = players.get(event.player)?; player_position.apply_movement(event.destination); }",
+      "queries": [
+        {
+          "id": "crpo-01",
+          "text": "apply player movement events to their position",
+          "split": "dev"
+        },
+        {
+          "id": "crpo-02",
+          "text": "where are update position events consumed",
+          "split": "held_out"
+        },
+        {
+          "id": "crpo-03",
+          "text": "move a player to the requested destination",
+          "split": "held_out"
+        }
+      ],
+      "target_matcher": {
+        "relative_path": "crates/emulator/src/game/systems/player/update_position.rs",
+        "content_contains": [
+          "update_position_reader"
+        ]
+      }
+    },
+    {
+      "id": "code-reforged-oauth",
+      "domain": "code-reforged",
+      "content_kind": "code",
+      "wing": "reforged",
+      "room": "crates",
+      "source_file": "crates/application-eventsource/src/usecases/auth/oauth_login_usecase.rs",
+      "content": "impl OAuthLoginUsecase { pub async fn execute(&self, request: OAuthLoginRequest) -> Result<LoginResponse, ApplicationError> { self.identity.authenticate(request).await } }",
+      "queries": [
+        {
+          "id": "croa-01",
+          "text": "authenticate an OAuth login request",
+          "split": "dev"
+        },
+        {
+          "id": "croa-02",
+          "text": "OAuthLoginUsecase execute implementation",
+          "split": "held_out"
+        },
+        {
+          "id": "croa-03",
+          "text": "turn an oauth request into a login response",
+          "split": "held_out"
+        },
+        {
+          "id": "croa-04",
+          "text": "application use case for external identity sign in",
+          "split": "held_out"
+        }
+      ],
+      "target_matcher": {
+        "relative_path": "crates/application-eventsource/src/usecases/auth/oauth_login_usecase.rs",
+        "content_contains": [
+          "OAuthLoginUsecase"
+        ]
+      }
+    },
+    {
+      "id": "code-reforged-combat",
+      "domain": "code-reforged",
+      "content_kind": "code",
+      "wing": "reforged",
+      "room": "crates",
+      "source_file": "crates/emulator/src/game/systems/combat/mod.rs",
+      "content": "for (player, mut combat_state, mut auras, mut periodic_effects) in players.iter_mut() { combat_state.tick(); periodic_effects.apply(player, &mut auras); }",
+      "queries": [
+        {
+          "id": "crco-01",
+          "text": "tick player combat state and periodic effects",
+          "split": "dev"
+        },
+        {
+          "id": "crco-02",
+          "text": "where are combat auras applied",
+          "split": "held_out"
+        },
+        {
+          "id": "crco-03",
+          "text": "process damage over time effects for players",
+          "split": "held_out"
+        },
+        {
+          "id": "crco-04",
+          "text": "player combat system loop",
+          "split": "held_out"
+        }
+      ],
+      "target_matcher": {
+        "relative_path": "crates/emulator/src/game/systems/combat/mod.rs",
+        "content_contains": [
+          "periodic_effects"
+        ]
+      }
+    },
+    {
+      "id": "code-mempalace-search",
+      "domain": "code-mempalace",
+      "content_kind": "code",
+      "wing": "mempalace-rs",
+      "room": "crates",
+      "source_file": "crates/store/src/lib.rs",
+      "content": "async fn search(&self, query: SearchQuery) -> Result<Vec<SearchHit>> { let vector_heaps = stream_exact_cosine(&query); fuse_with_fts5(vector_heaps, query) }",
+      "queries": [
+        {
+          "id": "cmse-01",
+          "text": "combine exact cosine search with FTS5 ranking",
+          "split": "dev"
+        },
+        {
+          "id": "cmse-02",
+          "text": "where does the SQLite memory store search",
+          "split": "held_out"
+        },
+        {
+          "id": "cmse-03",
+          "text": "bounded top-k vector heap retrieval",
+          "split": "held_out"
+        },
+        {
+          "id": "cmse-04",
+          "text": "fuse semantic and lexical candidates",
+          "split": "held_out",
+          "also_relevant": [
+            "code-mempalace-mcp"
+          ]
+        }
+      ],
+      "target_matcher": {
+        "relative_path": "crates/store/src/lib.rs",
+        "content_contains": [
+          "stream_exact_cosine"
+        ]
+      }
+    },
+    {
+      "id": "code-mempalace-miner",
+      "domain": "code-mempalace",
+      "content_kind": "code",
+      "wing": "mempalace-rs",
+      "room": "crates",
+      "source_file": "crates/core/src/project_miner.rs",
+      "content": "pub async fn mine_project(store: &dyn MemoryStore, project_dir: &Path, options: &MineOptions) { let files = scan_project(project_dir); for file in files { let chunks = chunk_file(&file); store.add_drawers(chunks).await?; } }",
+      "queries": [
+        {
+          "id": "cmmi-01",
+          "text": "scan a project and store its chunks",
+          "split": "dev"
+        },
+        {
+          "id": "cmmi-02",
+          "text": "project mining entry point",
+          "split": "held_out"
+        },
+        {
+          "id": "cmmi-03",
+          "text": "where are source files chunked into drawers",
+          "split": "held_out"
+        }
+      ],
+      "target_matcher": {
+        "relative_path": "crates/core/src/project_miner.rs",
+        "content_contains": [
+          "mine_project"
+        ]
+      }
+    },
+    {
+      "id": "code-mempalace-mcp",
+      "domain": "code-mempalace",
+      "content_kind": "code",
+      "wing": "mempalace-rs",
+      "room": "crates",
+      "source_file": "crates/mcp/src/lib.rs",
+      "content": "async fn mempalace_search(&self, Parameters(request): Parameters<SearchRequest>) -> McpResult { self.tool_search(request.query, request.limit, request.wing, request.room).await }",
+      "queries": [
+        {
+          "id": "cmcp-01",
+          "text": "MCP semantic search tool handler",
+          "split": "dev"
+        },
+        {
+          "id": "cmcp-02",
+          "text": "where SearchRequest parameters enter the server",
+          "split": "held_out"
+        },
+        {
+          "id": "cmcp-03",
+          "text": "expose palace search over MCP",
+          "split": "held_out"
+        },
+        {
+          "id": "cmcp-04",
+          "text": "mempalace_search tool_search request limit wing room",
+          "split": "held_out"
+        }
+      ],
+      "target_matcher": {
+        "relative_path": "crates/mcp/src/lib.rs",
+        "content_contains": [
+          "mempalace_search"
+        ]
+      }
+    },
+    {
+      "id": "code-mempalace-remine",
+      "domain": "code-mempalace",
+      "content_kind": "code",
+      "wing": "mempalace-rs",
+      "room": "crates",
+      "source_file": "crates/store/src/lib.rs",
+      "content": "pub async fn remine_all(&self, wing: Option<&str>) -> Result<usize> { create_embedding_migration_table(); embed_batches(); atomically_replace_embeddings(); }",
+      "queries": [
+        {
+          "id": "cmre-01",
+          "text": "recompute every stored embedding safely",
+          "split": "dev"
+        },
+        {
+          "id": "cmre-02",
+          "text": "full remine uses a temporary migration table",
+          "split": "held_out"
+        },
+        {
+          "id": "cmre-03",
+          "text": "atomically replace vectors after batch embedding",
+          "split": "held_out"
+        },
+        {
+          "id": "cmre-04",
+          "text": "remine_all implementation",
+          "split": "held_out"
+        }
+      ],
+      "target_matcher": {
+        "relative_path": "crates/store/src/lib.rs",
+        "content_contains": [
+          "atomically_replace_embeddings"
+        ]
+      }
+    },
+    {
+      "id": "conversation-preference",
+      "domain": "conversation",
+      "content_kind": "conversation",
+      "wing": "codex-sessions",
+      "room": "2026",
+      "source_file": "sessions/2026/coffee.jsonl",
+      "content": "user: I prefer light-roast Ethiopian coffee and avoid sugary creamers. A ceramic hand grinder is quiet enough for my morning routine.",
+      "queries": [
+        {
+          "id": "cvpr-01",
+          "text": "what kind of coffee do I prefer",
+          "split": "dev"
+        },
+        {
+          "id": "cvpr-02",
+          "text": "which coffee origin and roast did I like",
+          "split": "held_out"
+        },
+        {
+          "id": "cvpr-03",
+          "text": "what did I say about sweet creamer",
+          "split": "held_out"
+        },
+        {
+          "id": "cvpr-04",
+          "text": "remind me which quiet grinder fits my mornings",
+          "split": "held_out"
+        },
+        {
+          "id": "copr-05",
+          "text": "what beverage did I prefer without sugary additions",
+          "split": "held_out"
+        }
+      ],
+      "target_matcher": {
+        "drawer_id": "conversation-preference",
+        "content_contains": []
+      }
+    },
+    {
+      "id": "conversation-assistant",
+      "domain": "conversation",
+      "content_kind": "conversation",
+      "wing": "codex-sessions",
+      "room": "2026",
+      "source_file": "sessions/2026/posture.jsonl",
+      "content": "user: I need a trustworthy workplace posture video.",
+      "retrieval_text": "user: I need a trustworthy workplace posture video.\nassistant: I recommended the Mayo Clinic office ergonomics video and its monitor-height demonstration.",
+      "queries": [
+        {
+          "id": "cvas-01",
+          "text": "which posture video did the assistant recommend",
+          "split": "dev"
+        },
+        {
+          "id": "cvas-02",
+          "text": "what Mayo Clinic resource did you suggest",
+          "split": "held_out"
+        },
+        {
+          "id": "cvas-03",
+          "text": "remind me of the office ergonomics demonstration",
+          "split": "held_out"
+        },
+        {
+          "id": "cvas-04",
+          "text": "which video explained monitor height",
+          "split": "held_out"
+        }
+      ],
+      "target_matcher": {
+        "drawer_id": "conversation-assistant",
+        "content_contains": []
+      }
+    },
+    {
+      "id": "conversation-user-fact",
+      "domain": "conversation",
+      "content_kind": "conversation",
+      "wing": "codex-sessions",
+      "room": "2026",
+      "source_file": "sessions/2026/education.jsonl",
+      "content": "user: I graduated from Mapua University with a computer engineering degree in 2018.",
+      "queries": [
+        {
+          "id": "cvuf-01",
+          "text": "where did I graduate",
+          "split": "dev"
+        },
+        {
+          "id": "cvuf-02",
+          "text": "what degree did I earn",
+          "split": "held_out"
+        },
+        {
+          "id": "cvuf-03",
+          "text": "which university did I attend",
+          "split": "held_out"
+        },
+        {
+          "id": "cvuf-04",
+          "text": "when did I finish computer engineering",
+          "split": "held_out"
+        }
+      ],
+      "target_matcher": {
+        "drawer_id": "conversation-user-fact",
+        "content_contains": []
+      }
+    },
+    {
+      "id": "conversation-project-decision",
+      "domain": "conversation",
+      "content_kind": "conversation",
+      "wing": "codex-sessions",
+      "room": "2026",
+      "source_file": "sessions/2026/search.jsonl",
+      "content": "user: We decided to remove the brute-force semantic fallback because embedding search must remain fast and deterministic.",
+      "queries": [
+        {
+          "id": "cvpd-01",
+          "text": "why did we remove the brute force fallback",
+          "split": "dev"
+        },
+        {
+          "id": "cvpd-02",
+          "text": "what search fallback was deleted",
+          "split": "held_out"
+        },
+        {
+          "id": "cvpd-03",
+          "text": "decision about deterministic embedding retrieval",
+          "split": "held_out"
+        },
+        {
+          "id": "cvpd-04",
+          "text": "how should semantic search stay fast",
+          "split": "held_out"
+        }
+      ],
+      "target_matcher": {
+        "drawer_id": "conversation-project-decision",
+        "content_contains": []
+      }
+    },
+    {
+      "id": "conversation-hardware",
+      "domain": "conversation",
+      "content_kind": "conversation",
+      "wing": "codex-sessions",
+      "room": "2026",
+      "source_file": "sessions/2026/hardware.jsonl",
+      "content": "user: My development machine has 32 GB of RAM, but I want the memory server to stay below 300 MB during search.",
+      "queries": [
+        {
+          "id": "cvhw-01",
+          "text": "how much RAM is in my development machine",
+          "split": "dev"
+        },
+        {
+          "id": "cvhw-02",
+          "text": "what is the memory budget for search",
+          "split": "held_out"
+        },
+        {
+          "id": "cvhw-03",
+          "text": "how large may the memory server become",
+          "split": "held_out"
+        },
+        {
+          "id": "cvhw-04",
+          "text": "development workstation memory capacity",
+          "split": "held_out"
+        }
+      ],
+      "target_matcher": {
+        "drawer_id": "conversation-hardware",
+        "content_contains": []
+      }
+    },
+    {
+      "id": "conversation-temporal",
+      "domain": "conversation",
+      "content_kind": "conversation",
+      "wing": "codex-sessions",
+      "room": "2026",
+      "source_file": "sessions/2026/purchase.jsonl",
+      "filed_at": "2026-07-05T09:00:00+08:00",
+      "content": "user: I bought a compact countertop ice maker today for the kitchen.",
+      "queries": [
+        {
+          "id": "cvte-01",
+          "text": "what kitchen appliance did I buy",
+          "split": "dev"
+        },
+        {
+          "id": "cvte-02",
+          "text": "what did I purchase 10 days ago",
+          "split": "held_out",
+          "as_of": "2026-07-15T09:00:00+08:00"
+        },
+        {
+          "id": "cvte-03",
+          "text": "which countertop machine was purchased",
+          "split": "held_out"
+        },
+        {
+          "id": "cvte-04",
+          "text": "remind me about the compact ice maker",
+          "split": "held_out"
+        }
+      ],
+      "target_matcher": {
+        "drawer_id": "conversation-temporal",
+        "content_contains": []
+      }
+    },
+    {
+      "id": "docs-readme-model",
+      "domain": "documentation",
+      "content_kind": "documentation",
+      "wing": "mempalace-rs",
+      "room": "general",
+      "source_file": "README.md",
+      "content": "Embedding model: the default is minishlab/potion-code-16M-v2. Models download from Hugging Face on first use and run locally through model2vec-rs.",
+      "queries": [
+        {
+          "id": "dcrm-01",
+          "text": "what is the default embedding model",
+          "split": "dev"
+        },
+        {
+          "id": "dcrm-02",
+          "text": "where do models download from",
+          "split": "held_out"
+        },
+        {
+          "id": "dcrm-03",
+          "text": "which Rust embedding runtime is used",
+          "split": "held_out"
+        },
+        {
+          "id": "dcrm-04",
+          "text": "does semantic embedding run locally",
+          "split": "held_out"
+        }
+      ],
+      "target_matcher": {
+        "drawer_id": "docs-readme-model",
+        "content_contains": []
+      }
+    },
+    {
+      "id": "docs-prd-budgets",
+      "domain": "documentation",
+      "content_kind": "documentation",
+      "wing": "mempalace-rs",
+      "room": "general",
+      "source_file": "prd-multi-domain-semantic-retrieval.md",
+      "content": "Performance acceptance: p95 search latency stays below one second on 150,000 drawers, peak RSS remains below 300 MB, and only one embedding model loads per process.",
+      "queries": [
+        {
+          "id": "dcpb-01",
+          "text": "what is the peak RSS budget",
+          "split": "dev"
+        },
+        {
+          "id": "dcpb-02",
+          "text": "latency target for a large palace",
+          "split": "held_out"
+        },
+        {
+          "id": "dcpb-03",
+          "text": "how many embedding models may load",
+          "split": "held_out"
+        },
+        {
+          "id": "dcpb-04",
+          "text": "performance criteria at 150000 drawers",
+          "split": "held_out"
+        }
+      ],
+      "target_matcher": {
+        "drawer_id": "docs-prd-budgets",
+        "content_contains": []
+      }
+    },
+    {
+      "id": "docs-adr-storage",
+      "domain": "documentation",
+      "content_kind": "documentation",
+      "wing": "mempalace-rs",
+      "room": "docs",
+      "source_file": "docs/adr/003-sqlite-exact-cosine.md",
+      "content": "Decision: use SQLite plus a bounded exact-cosine scan and FTS5. Do not restore a process-local HNSW or vectorlite index because memory must scale independently of drawer count.",
+      "queries": [
+        {
+          "id": "dcas-01",
+          "text": "why was vectorlite rejected",
+          "split": "dev"
+        },
+        {
+          "id": "dcas-02",
+          "text": "storage decision for semantic vectors",
+          "split": "held_out"
+        },
+        {
+          "id": "dcas-03",
+          "text": "why not keep an HNSW index in memory",
+          "split": "held_out"
+        },
+        {
+          "id": "dcas-04",
+          "text": "SQLite exact cosine architecture rationale",
+          "split": "held_out"
+        }
+      ],
+      "target_matcher": {
+        "drawer_id": "docs-adr-storage",
+        "content_contains": []
+      }
+    },
+    {
+      "id": "docs-aaak",
+      "domain": "documentation",
+      "content_kind": "documentation",
+      "wing": "mempalace-rs",
+      "room": "docs",
+      "source_file": "docs/aaak-format.md",
+      "content": "AAAK is a lossy compressed memory dialect. Entity codes are three uppercase letters, dates use ISO format, fields are pipe-separated, and importance uses one to five stars.",
+      "queries": [
+        {
+          "id": "dcaa-01",
+          "text": "what is AAAK",
+          "split": "dev"
+        },
+        {
+          "id": "dcaa-02",
+          "text": "how are entities encoded in the compressed dialect",
+          "split": "held_out"
+        },
+        {
+          "id": "dcaa-03",
+          "text": "what date format does AAAK use",
+          "split": "held_out"
+        },
+        {
+          "id": "dcaa-04",
+          "text": "is AAAK compression lossless",
+          "split": "held_out"
+        }
+      ],
+      "target_matcher": {
+        "drawer_id": "docs-aaak",
+        "content_contains": []
+      }
+    },
+    {
+      "id": "docs-remine-guide",
+      "domain": "documentation",
+      "content_kind": "documentation",
+      "wing": "mempalace-rs",
+      "room": "docs",
+      "source_file": "docs/remine.md",
+      "content": "Run a full remine when changing the embedding model or representation. Remine recomputes vectors but does not rechunk files; delete and mine a wing again to adopt new structural chunking.",
+      "queries": [
+        {
+          "id": "dcrg-01",
+          "text": "when is a full remine required",
+          "split": "dev"
+        },
+        {
+          "id": "dcrg-02",
+          "text": "does remine rechunk source files",
+          "split": "held_out"
+        },
+        {
+          "id": "dcrg-03",
+          "text": "how do I adopt new structural chunks",
+          "split": "held_out"
+        },
+        {
+          "id": "dcrg-04",
+          "text": "recompute vectors after changing models",
+          "split": "held_out"
+        }
+      ],
+      "target_matcher": {
+        "drawer_id": "docs-remine-guide",
+        "content_contains": []
+      }
+    },
+    {
+      "id": "diary-ranking-win",
+      "domain": "diary",
+      "content_kind": "diary",
+      "wing": "wing_codex",
+      "room": "diary",
+      "source_file": "diary/search-quality",
+      "filed_at": "2026-07-15T15:00:00+08:00",
+      "content": "PROJ: semantic retrieval | changed global code query expansion to candidate-aware views | LongMemEval R@5 improved from 91.6 to 95.4 | p95 remained 12ms",
+      "queries": [
+        {
+          "id": "dyrw-01",
+          "text": "what ranking change improved semantic recall",
+          "split": "dev"
+        },
+        {
+          "id": "dyrw-02",
+          "text": "LongMemEval result after candidate aware views",
+          "split": "held_out"
+        },
+        {
+          "id": "dyrw-03",
+          "text": "what latency remained at 12 milliseconds",
+          "split": "held_out"
+        },
+        {
+          "id": "dyrw-04",
+          "text": "diary entry about code query expansion",
+          "split": "held_out"
+        }
+      ],
+      "target_matcher": {
+        "drawer_id": "diary-ranking-win",
+        "content_contains": []
+      }
+    },
+    {
+      "id": "diary-model-bakeoff",
+      "domain": "diary",
+      "content_kind": "diary",
+      "wing": "wing_codex",
+      "room": "diary",
+      "source_file": "diary/model-bakeoff",
+      "filed_at": "2026-07-15T16:00:00+08:00",
+      "content": "PROJ: model bakeoff | potion-retrieval-32M reached 92.4 R@5 but peaked near 332 MB RSS | kept potion-code-16M-v2 as the resource-safe control",
+      "queries": [
+        {
+          "id": "dymb-01",
+          "text": "how much RAM did the 32M retrieval model use",
+          "split": "dev"
+        },
+        {
+          "id": "dymb-02",
+          "text": "which model remained the resource safe control",
+          "split": "held_out"
+        },
+        {
+          "id": "dymb-03",
+          "text": "recall result for potion retrieval 32M",
+          "split": "held_out"
+        },
+        {
+          "id": "dymb-04",
+          "text": "why was the larger model not selected",
+          "split": "held_out"
+        }
+      ],
+      "target_matcher": {
+        "drawer_id": "diary-model-bakeoff",
+        "content_contains": []
+      }
+    },
+    {
+      "id": "diary-schema-migration",
+      "domain": "diary",
+      "content_kind": "diary",
+      "wing": "wing_codex",
+      "room": "diary",
+      "source_file": "diary/content-kind",
+      "filed_at": "2026-07-15T17:00:00+08:00",
+      "content": "PROJ: content kind migration | added code conversation documentation diary prose unknown | legacy SQLite rows default safely to unknown",
+      "queries": [
+        {
+          "id": "dysk-01",
+          "text": "which content kinds were added",
+          "split": "dev"
+        },
+        {
+          "id": "dysk-02",
+          "text": "what happens to legacy SQLite rows",
+          "split": "held_out"
+        },
+        {
+          "id": "dysk-03",
+          "text": "schema migration default for old drawers",
+          "split": "held_out"
+        }
+      ],
+      "target_matcher": {
+        "drawer_id": "diary-schema-migration",
+        "content_contains": []
+      }
+    },
+    {
+      "id": "diary-restart-test",
+      "domain": "diary",
+      "content_kind": "diary",
+      "wing": "wing_codex",
+      "room": "diary",
+      "source_file": "diary/mcp-restart",
+      "filed_at": "2026-07-15T18:00:00+08:00",
+      "content": "PROJ: MCP restart validation | CLI and MCP returned identical top ten ordering for the reforged wing after the server restart",
+      "queries": [
+        {
+          "id": "dyrt-01",
+          "text": "what was validated after restarting MCP",
+          "split": "dev"
+        },
+        {
+          "id": "dyrt-02",
+          "text": "did CLI and MCP rankings match",
+          "split": "held_out"
+        },
+        {
+          "id": "dyrt-03",
+          "text": "which wing was used for parity testing",
+          "split": "held_out"
+        },
+        {
+          "id": "dyrt-04",
+          "text": "top ten ordering restart diary",
+          "split": "held_out"
+        }
+      ],
+      "target_matcher": {
+        "drawer_id": "diary-restart-test",
+        "content_contains": []
+      }
+    },
+    {
+      "id": "prose-garden",
+      "domain": "prose",
+      "content_kind": "prose",
+      "wing": "notes",
+      "room": "garden",
+      "source_file": "notes/garden.txt",
+      "content": "The balcony garden has cherry tomatoes beside basil and mint. Ladybugs control aphids without neem oil, and the herbs become ingredients for weekend dinners.",
+      "queries": [
+        {
+          "id": "prga-01",
+          "text": "what grows beside the cherry tomatoes",
+          "split": "dev"
+        },
+        {
+          "id": "prga-02",
+          "text": "how are aphids controlled naturally",
+          "split": "held_out"
+        },
+        {
+          "id": "prga-03",
+          "text": "which homegrown ingredients can be used for dinner",
+          "split": "held_out"
+        },
+        {
+          "id": "prga-04",
+          "text": "balcony garden herbs and vegetables",
+          "split": "held_out"
+        },
+        {
+          "id": "prga-05",
+          "text": "what should be planted beside the kitchen window",
+          "split": "held_out"
+        }
+      ],
+      "target_matcher": {
+        "drawer_id": "prose-garden",
+        "content_contains": []
+      }
+    },
+    {
+      "id": "prose-travel",
+      "domain": "prose",
+      "content_kind": "prose",
+      "wing": "notes",
+      "room": "travel",
+      "source_file": "notes/amsterdam.txt",
+      "content": "For Amsterdam, the Flying Pig Downtown hostel is close to the Red Light District. Reserve early, bring a transit card, and visit the Rijksmuseum on a weekday morning.",
+      "queries": [
+        {
+          "id": "prtr-01",
+          "text": "which hostel is near the Red Light District",
+          "split": "dev"
+        },
+        {
+          "id": "prtr-02",
+          "text": "where should I stay in Amsterdam",
+          "split": "held_out"
+        },
+        {
+          "id": "prtr-03",
+          "text": "when should the Rijksmuseum be visited",
+          "split": "held_out"
+        },
+        {
+          "id": "prtr-04",
+          "text": "what travel card should I bring",
+          "split": "held_out"
+        },
+        {
+          "id": "prtr-05",
+          "text": "where did the canal walk begin before the museum",
+          "split": "held_out"
+        }
+      ],
+      "target_matcher": {
+        "drawer_id": "prose-travel",
+        "content_contains": []
+      }
+    }
+  ],
+  "baseline_recall_at_5": {
+    "code-reforged": 1.0,
+    "code-mempalace": 1.0,
+    "conversation": 1.0,
+    "documentation": 1.0,
+    "diary": 1.0,
+    "prose": 1.0
+  }
+}

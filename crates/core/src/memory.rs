@@ -1,18 +1,89 @@
-use std::collections::HashSet;
+use std::{collections::HashSet, fmt, str::FromStr};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::Result;
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum ContentKind {
+    Code,
+    Conversation,
+    Documentation,
+    Diary,
+    Prose,
+    #[default]
+    #[serde(other)]
+    Unknown,
+}
+
+impl fmt::Display for ContentKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Code => "code",
+            Self::Conversation => "conversation",
+            Self::Documentation => "documentation",
+            Self::Diary => "diary",
+            Self::Prose => "prose",
+            Self::Unknown => "unknown",
+        })
+    }
+}
+
+impl FromStr for ContentKind {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "code" => Ok(Self::Code),
+            "conversation" => Ok(Self::Conversation),
+            "documentation" => Ok(Self::Documentation),
+            "diary" => Ok(Self::Diary),
+            "prose" => Ok(Self::Prose),
+            "unknown" => Ok(Self::Unknown),
+            _ => Err(format!(
+                "invalid content kind {value:?}; expected code, conversation, documentation, diary, prose, or unknown"
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DrawerMetadata {
+    #[serde(default)]
+    pub content_kind: ContentKind,
     pub wing: String,
     pub room: String,
     pub source_file: Option<String>,
     pub chunk_index: i64,
     pub added_by: String,
     pub filed_at: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ContentKind, DrawerMetadata};
+
+    #[test]
+    fn legacy_metadata_defaults_content_kind_to_unknown() {
+        let metadata: DrawerMetadata = serde_json::from_str(
+            r#"{"wing":"legacy","room":"notes","source_file":null,"chunk_index":0,"added_by":"test","filed_at":null}"#,
+        )
+        .unwrap();
+
+        assert_eq!(metadata.content_kind, ContentKind::Unknown);
+    }
+
+    #[test]
+    fn future_serialized_content_kind_falls_back_to_unknown() {
+        let metadata: DrawerMetadata = serde_json::from_str(
+            r#"{"content_kind":"spreadsheet","wing":"legacy","room":"notes","source_file":null,"chunk_index":0,"added_by":"test","filed_at":null}"#,
+        )
+        .unwrap();
+
+        assert_eq!(metadata.content_kind, ContentKind::Unknown);
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -43,6 +114,9 @@ pub struct SearchQuery {
     pub wing: Option<String>,
     pub room: Option<String>,
     pub min_score: Option<f32>,
+    /// Optional reference time used to resolve relative temporal phrases.
+    #[serde(default)]
+    pub as_of: Option<String>,
 }
 
 impl SearchQuery {
@@ -53,6 +127,7 @@ impl SearchQuery {
             wing: None,
             room: None,
             min_score: None,
+            as_of: None,
         }
     }
 }

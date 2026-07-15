@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 async-trait.workspace = true
+chrono.workspace = true
 model2vec-rs.workspace = true
 futures.workspace = true
 rusqlite.workspace = true

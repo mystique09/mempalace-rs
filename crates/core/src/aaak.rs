@@ -1193,7 +1193,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{AaakDialect, AaakFile, AaakTunnel, AaakZettel};
-    use crate::DrawerMetadata;
+    use crate::{ContentKind, DrawerMetadata};
 
     #[test]
     fn compress_includes_header_topics_and_flags() {
@@ -1201,6 +1201,7 @@ mod tests {
         entities.insert("Benji".to_owned(), "BEN".to_owned());
         let dialect = AaakDialect::new(entities, Vec::new());
         let metadata = DrawerMetadata {
+            content_kind: ContentKind::Documentation,
             wing: "project".to_owned(),
             room: "notes".to_owned(),
             source_file: Some("F:/Dev/example/README.md".to_owned()),

@@ -7,8 +7,9 @@ use std::{
 
 use clap::{Parser, Subcommand};
 use mempalace_core::{
-    AaakDialect, DetectedEntities, Drawer, DrawerMetadata, KnowledgeGraph, MemoryStore,
-    MempalaceConfig, MineOptions, SearchQuery, detect_entities, mine_project, scan_for_detection,
+    AaakDialect, ContentKind, DetectedEntities, Drawer, DrawerMetadata, KnowledgeGraph,
+    MemoryStore, MempalaceConfig, MineOptions, SearchQuery, detect_entities, mine_project,
+    scan_for_detection,
 };
 use mempalace_mcp::McpServer;
 use mempalace_store::SqliteMemoryStore;
@@ -55,6 +56,9 @@ enum Command {
         results: usize,
         #[arg(long)]
         min_score: Option<f32>,
+        /// Reference time for relative temporal queries (RFC3339 or YYYY-MM-DD).
+        #[arg(long = "as-of")]
+        as_of: Option<String>,
     },
     Compress {
         #[arg(long)]
@@ -125,6 +129,8 @@ enum ToolCommand {
         wing: Option<String>,
         #[arg(long)]
         room: Option<String>,
+        #[arg(long = "as-of")]
+        as_of: Option<String>,
     },
     CheckDuplicate {
         #[arg(long)]
@@ -143,6 +149,8 @@ enum ToolCommand {
         source_file: Option<String>,
         #[arg(long = "added-by", default_value = "cli")]
         added_by: String,
+        #[arg(long = "content-kind", default_value_t = ContentKind::Unknown)]
+        content_kind: ContentKind,
     },
     DeleteDrawer {
         #[arg(long = "drawer-id")]
@@ -231,6 +239,7 @@ struct SearchOptions {
     room: Option<String>,
     results: usize,
     min_score: Option<f32>,
+    as_of: Option<String>,
 }
 
 const INIT_ROOM_MAP: &[(&str, &str)] = &[
@@ -357,6 +366,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             room,
             results,
             min_score,
+            as_of,
         } => {
             let app = open_context(cli.palace, cli.model.as_deref()).await?;
             run_search(
@@ -369,6 +379,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     room,
                     results,
                     min_score,
+                    as_of,
                 },
             )
             .await?;
@@ -596,6 +607,7 @@ fn extract_chroma_drawers(db_path: &PathBuf) -> Result<Vec<Drawer>, Box<dyn std:
             .cloned()
             .unwrap_or_else(|| "general".to_owned());
         let source_file = metadata.get("source_file").cloned();
+        let content_kind = infer_import_content_kind(&wing, &room, source_file.as_deref());
         let added_by = metadata
             .get("added_by")
             .cloned()
@@ -607,6 +619,7 @@ fn extract_chroma_drawers(db_path: &PathBuf) -> Result<Vec<Drawer>, Box<dyn std:
             content: document,
             retrieval_text: None,
             metadata: DrawerMetadata {
+                content_kind,
                 wing,
                 room,
                 source_file,
@@ -618,6 +631,54 @@ fn extract_chroma_drawers(db_path: &PathBuf) -> Result<Vec<Drawer>, Box<dyn std:
     }
 
     Ok(drawers)
+}
+
+fn infer_import_content_kind(wing: &str, room: &str, source_file: Option<&str>) -> ContentKind {
+    let wing = wing.to_ascii_lowercase();
+    let room = room.to_ascii_lowercase();
+    let source = source_file
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .replace('\\', "/");
+    let path = Path::new(&source);
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+
+    if room == "diary" || source.split('/').any(|part| part == "diary") {
+        return ContentKind::Diary;
+    }
+    if [
+        "c", "cc", "cpp", "cxx", "cs", "go", "h", "hpp", "java", "js", "jsx", "kt", "kts", "mjs",
+        "php", "py", "rb", "rs", "sh", "swift", "ts", "tsx", "zsh",
+    ]
+    .contains(&extension)
+    {
+        return ContentKind::Code;
+    }
+    if ["session", "conversation", "transcript", "chat"]
+        .iter()
+        .any(|marker| wing.contains(marker) || room.contains(marker) || source.contains(marker))
+    {
+        return ContentKind::Conversation;
+    }
+    if ["md", "mdx", "rst", "adoc", "asciidoc"].contains(&extension)
+        || ["readme", "prd", "adr", "changelog"]
+            .iter()
+            .any(|prefix| file_name.starts_with(prefix))
+    {
+        return ContentKind::Documentation;
+    }
+    if source_file.is_some() {
+        ContentKind::Prose
+    } else {
+        ContentKind::Unknown
+    }
 }
 
 async fn run_tool_command(
@@ -638,8 +699,9 @@ async fn run_tool_command(
             limit,
             wing,
             room,
+            as_of,
         } => server
-            .tool_search(query, limit, wing, room)
+            .tool_search(query, limit, wing, room, as_of)
             .await
             .map_err(io::Error::other)?,
         ToolCommand::CheckDuplicate { content, threshold } => server
@@ -652,8 +714,9 @@ async fn run_tool_command(
             content,
             source_file,
             added_by,
+            content_kind,
         } => server
-            .tool_add_drawer(wing, room, content, source_file, added_by)
+            .tool_add_drawer(wing, room, content, source_file, added_by, content_kind)
             .await
             .map_err(io::Error::other)?,
         ToolCommand::DeleteDrawer { drawer_id } => server
@@ -1926,6 +1989,7 @@ async fn run_search(
     search.wing = wing;
     search.room = options.room;
     search.min_score = options.min_score;
+    search.as_of = options.as_of;
 
     let hits = app.store.search(search).await?;
     if hits.is_empty() {
@@ -2066,9 +2130,10 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        Cli, Command, OnboardingPerson, ToolCommand, infer_wing_from_scope,
-        looks_like_project_root, resolve_search_wing, run_project_entity_detection,
-        write_aaak_bootstrap, write_entity_registry, write_project_config_scaffold,
+        Cli, Command, OnboardingPerson, ToolCommand, infer_import_content_kind,
+        infer_wing_from_scope, looks_like_project_root, resolve_search_wing,
+        run_project_entity_detection, write_aaak_bootstrap, write_entity_registry,
+        write_project_config_scaffold,
     };
     use clap::Parser;
 
@@ -2079,6 +2144,26 @@ mod tests {
             Command::Search { scope, .. } => assert_eq!(scope, Some(".".into())),
             command => panic!("unexpected command parsed: {command:?}"),
         }
+    }
+
+    #[test]
+    fn chroma_import_infers_content_kind_without_treating_unknown_as_code() {
+        assert_eq!(
+            infer_import_content_kind("chat-server", "session-runtime", Some("src/main.rs")),
+            mempalace_core::ContentKind::Code
+        );
+        assert_eq!(
+            infer_import_content_kind("codex-sessions", "2026", Some("2026/transcript.md")),
+            mempalace_core::ContentKind::Conversation
+        );
+        assert_eq!(
+            infer_import_content_kind("project", "docs", Some("README.md")),
+            mempalace_core::ContentKind::Documentation
+        );
+        assert_eq!(
+            infer_import_content_kind("legacy", "general", None),
+            mempalace_core::ContentKind::Unknown
+        );
     }
 
     #[test]

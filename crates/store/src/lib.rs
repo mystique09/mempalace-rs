@@ -1,7 +1,7 @@
 use std::{
     cmp::{Ordering, Reverse},
     collections::{BinaryHeap, HashMap, HashSet},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering as AtomicOrdering},
@@ -9,19 +9,20 @@ use std::{
 };
 
 use async_trait::async_trait;
+use chrono::{DateTime, Datelike, Duration, FixedOffset, NaiveDate, Weekday};
 use model2vec_rs::model::StaticModel;
 use rusqlite::{Connection, params};
 
 use mempalace_core::{
-    Drawer, DrawerMetadata, MemoryStore, MempalaceError, Result, RoomStatus, SearchHit,
-    SearchQuery, StoreStatus,
+    ContentKind, Drawer, DrawerMetadata, MemoryStore, MempalaceError, Result, RoomStatus,
+    SearchHit, SearchQuery, StoreStatus,
 };
 
 const DEFAULT_MODEL_REPO: &str = "minishlab/potion-code-16M-v2";
 const LEGACY_DEFAULT_MODEL_REPO: &str = "minishlab/potion-base-32M";
 const EMBEDDING_MODEL_KEY: &str = "embedding_model";
 const EMBEDDING_REPRESENTATION_KEY: &str = "embedding_representation";
-const CURRENT_EMBEDDING_REPRESENTATION: &str = "source-identifiers-v1";
+const CURRENT_EMBEDDING_REPRESENTATION: &str = "content-kind-v3";
 const RRF_K: usize = 60;
 
 /// Schema DDL for the SQLite store.
@@ -30,6 +31,7 @@ CREATE TABLE IF NOT EXISTS drawers (
     id          TEXT PRIMARY KEY,
     content     TEXT NOT NULL,
     retrieval_text TEXT,
+    content_kind TEXT NOT NULL DEFAULT 'unknown',
     wing        TEXT NOT NULL,
     room        TEXT NOT NULL,
     source_file TEXT,
@@ -96,18 +98,97 @@ fn stored_embedding_representation(conn: &Connection) -> Result<Option<String>> 
 }
 
 fn migrate_schema(conn: &Connection) -> Result<()> {
-    let has_retrieval_text = {
+    let columns = {
         let mut statement = conn.prepare("PRAGMA table_info(drawers)")?;
         statement
             .query_map([], |row| row.get::<_, String>(1))?
             .collect::<std::result::Result<Vec<_>, _>>()?
-            .iter()
-            .any(|column| column == "retrieval_text")
     };
-    if !has_retrieval_text {
+    if !columns.iter().any(|column| column == "retrieval_text") {
         conn.execute("ALTER TABLE drawers ADD COLUMN retrieval_text TEXT", [])?;
     }
+    let has_content_kind = columns.iter().any(|column| column == "content_kind");
+    if !has_content_kind {
+        let transaction = conn.unchecked_transaction()?;
+        transaction.execute(
+            "ALTER TABLE drawers ADD COLUMN content_kind TEXT NOT NULL DEFAULT 'unknown'",
+            [],
+        )?;
+        backfill_legacy_content_kinds(&transaction)?;
+        transaction.commit()?;
+    }
     Ok(())
+}
+
+fn backfill_legacy_content_kinds(conn: &Connection) -> Result<()> {
+    let rows = {
+        let mut statement = conn.prepare("SELECT id, wing, room, source_file FROM drawers")?;
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+    };
+
+    let mut update = conn.prepare("UPDATE drawers SET content_kind = ?1 WHERE id = ?2")?;
+    for (id, wing, room, source_file) in rows {
+        let kind = infer_legacy_content_kind(&wing, &room, source_file.as_deref());
+        update.execute(params![kind.to_string(), id])?;
+    }
+    Ok(())
+}
+
+fn infer_legacy_content_kind(wing: &str, room: &str, source_file: Option<&str>) -> ContentKind {
+    let wing = wing.to_ascii_lowercase();
+    let room = room.to_ascii_lowercase();
+    let source = source_file
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .replace('\\', "/");
+    let path = Path::new(&source);
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+
+    if room == "diary" || source.split(['/', '\\']).any(|part| part == "diary") {
+        return ContentKind::Diary;
+    }
+    if [
+        "c", "cc", "cpp", "cxx", "cs", "go", "h", "hpp", "java", "js", "jsx", "kt", "kts", "mjs",
+        "php", "py", "rb", "rs", "sh", "swift", "ts", "tsx", "zsh",
+    ]
+    .contains(&extension)
+    {
+        return ContentKind::Code;
+    }
+    if ["session", "conversation", "transcript", "chat"]
+        .iter()
+        .any(|marker| wing.contains(marker) || room.contains(marker) || source.contains(marker))
+    {
+        return ContentKind::Conversation;
+    }
+    if ["md", "mdx", "rst", "adoc", "asciidoc"].contains(&extension)
+        || ["readme", "prd", "adr", "changelog"]
+            .iter()
+            .any(|prefix| file_name.starts_with(prefix))
+    {
+        return ContentKind::Documentation;
+    }
+    if source_file.is_some() {
+        ContentKind::Prose
+    } else {
+        ContentKind::Unknown
+    }
 }
 
 fn initialize_legacy_embedding_model(conn: &Connection) -> Result<()> {
@@ -393,14 +474,14 @@ impl SqliteMemoryStore {
             let batch = self.with_conn(|conn| {
                 let (sql, wing_param): (&str, Option<&str>) = if wing.is_some() {
                     (
-                        "SELECT id, content, retrieval_text, source_file FROM drawers
+                        "SELECT id, content, retrieval_text, source_file, content_kind FROM drawers
                          WHERE wing = ?1 AND (?2 IS NULL OR id > ?2)
                          ORDER BY id LIMIT ?3",
                         wing,
                     )
                 } else {
                     (
-                        "SELECT id, content, retrieval_text, source_file FROM drawers
+                        "SELECT id, content, retrieval_text, source_file, content_kind FROM drawers
                          WHERE (?2 IS NULL OR id > ?2)
                          ORDER BY id LIMIT ?3",
                         None,
@@ -414,6 +495,7 @@ impl SqliteMemoryStore {
                             row.get::<_, String>(1)?,
                             row.get::<_, Option<String>>(2)?,
                             row.get::<_, Option<String>>(3)?,
+                            row.get::<_, String>(4)?,
                         ))
                     })?
                     .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -426,14 +508,19 @@ impl SqliteMemoryStore {
 
             let texts = batch
                 .iter()
-                .map(|(_, content, retrieval_text, source_file)| {
-                    embedding_input(content, retrieval_text.as_deref(), source_file.as_deref())
+                .map(|(_, content, retrieval_text, source_file, content_kind)| {
+                    embedding_input(
+                        content,
+                        retrieval_text.as_deref(),
+                        source_file.as_deref(),
+                        content_kind.parse().unwrap_or(ContentKind::Unknown),
+                    )
                 })
                 .collect::<Vec<_>>();
             let vectors = self.embedder.embed_batch(&texts)?;
             self.with_conn(|conn| {
                 let transaction = conn.unchecked_transaction()?;
-                for ((id, _, _, _), vector) in batch.iter().zip(&vectors) {
+                for ((id, _, _, _, _), vector) in batch.iter().zip(&vectors) {
                     transaction.execute(
                         "INSERT INTO embedding_migration(id, embedding) VALUES (?1, ?2)",
                         params![id, vector_to_blob(vector)],
@@ -444,7 +531,7 @@ impl SqliteMemoryStore {
             })?;
 
             total += batch.len();
-            last_id = batch.last().map(|(id, _, _, _)| id.clone());
+            last_id = batch.last().map(|(id, _, _, _, _)| id.clone());
         }
 
         let result = self.with_conn(|conn| {
@@ -555,6 +642,7 @@ impl MemoryStore for SqliteMemoryStore {
                     &drawer.content,
                     drawer.retrieval_text.as_deref(),
                     drawer.metadata.source_file.as_deref(),
+                    drawer.metadata.content_kind,
                 )
             })
             .collect();
@@ -567,12 +655,13 @@ impl MemoryStore for SqliteMemoryStore {
                 let blob = vector_to_blob(vector);
 
                 tx.execute(
-                    "INSERT INTO drawers (id, content, retrieval_text, wing, room, source_file, chunk_index, added_by, filed_at, embedding)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                    "INSERT INTO drawers (id, content, retrieval_text, content_kind, wing, room, source_file, chunk_index, added_by, filed_at, embedding)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                     params![
                         drawer.id,
                         drawer.content,
                         drawer.retrieval_text,
+                        drawer.metadata.content_kind.to_string(),
                         drawer.metadata.wing,
                         drawer.metadata.room,
                         drawer.metadata.source_file,
@@ -592,7 +681,7 @@ impl MemoryStore for SqliteMemoryStore {
     async fn get_drawer(&self, drawer_id: &str) -> Result<Option<Drawer>> {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT id, content, retrieval_text, wing, room, source_file, chunk_index, added_by, filed_at
+                "SELECT id, content, retrieval_text, content_kind, wing, room, source_file, chunk_index, added_by, filed_at
                      FROM drawers WHERE id = ?1",
             )?;
 
@@ -626,14 +715,14 @@ impl MemoryStore for SqliteMemoryStore {
         self.with_conn(|conn| {
             let (sql, params_vec): (String, Vec<String>) = if let Some(w) = wing {
                 (
-                    "SELECT id, content, retrieval_text, wing, room, source_file, chunk_index, added_by, filed_at
+                    "SELECT id, content, retrieval_text, content_kind, wing, room, source_file, chunk_index, added_by, filed_at
                      FROM drawers WHERE wing = ?1"
                         .to_string(),
                     vec![w.to_string()],
                 )
             } else {
                 (
-                    "SELECT id, content, retrieval_text, wing, room, source_file, chunk_index, added_by, filed_at
+                    "SELECT id, content, retrieval_text, content_kind, wing, room, source_file, chunk_index, added_by, filed_at
                      FROM drawers"
                         .to_string(),
                     vec![],
@@ -666,14 +755,20 @@ impl MemoryStore for SqliteMemoryStore {
         let result_limit = query.limit.min(1024);
         let retrieval_limit = Self::retrieval_limit(query.limit);
         let query_views = query_embedding_views(&query.query);
-        let query_vectors = self.embedder.embed_batch(&query_views)?;
+        let query_texts = query_views
+            .iter()
+            .map(|view| view.text.clone())
+            .collect::<Vec<_>>();
+        let query_vectors = self.embedder.embed_batch(&query_texts)?;
         let original_query_vector = query_vectors
             .first()
             .ok_or_else(|| MempalaceError::Embedding("no query embedding returned".to_owned()))?;
 
         self.with_conn(|conn| {
             let filter_where = Self::search_filter_clause(&query);
-            let vector_sql = format!("SELECT rowid, embedding FROM drawers {filter_where}");
+            let vector_sql = format!(
+                "SELECT rowid, embedding, content_kind FROM drawers {filter_where}"
+            );
             let mut vector_stmt = conn.prepare(&vector_sql)?;
             let mut vector_rows = vector_stmt.query([])?;
             let mut vector_heaps = query_vectors
@@ -684,7 +779,18 @@ impl MemoryStore for SqliteMemoryStore {
             while let Some(row) = vector_rows.next()? {
                 let rowid: i64 = row.get(0)?;
                 let embedding: Vec<u8> = row.get(1)?;
-                for (query_vector, heap) in query_vectors.iter().zip(&mut vector_heaps) {
+                let content_kind = row
+                    .get::<_, String>(2)?
+                    .parse()
+                    .unwrap_or(ContentKind::Unknown);
+                for ((query_vector, view), heap) in query_vectors
+                    .iter()
+                    .zip(&query_views)
+                    .zip(&mut vector_heaps)
+                {
+                    if !view.target.applies_to(content_kind) {
+                        continue;
+                    }
                     let similarity = cosine_similarity_blob(query_vector, &embedding)?;
                     retain_top_candidate(
                         heap,
@@ -700,22 +806,17 @@ impl MemoryStore for SqliteMemoryStore {
                     .map(|Reverse(candidate)| candidate)
                     .collect::<Vec<_>>();
                 candidates.sort_by(|left, right| right.cmp(left));
-                let weight = embedding_view_weight(view_index);
+                let weight = query_views[view_index].weight;
                 for (rank, candidate) in candidates.iter().enumerate() {
                     *fused_scores.entry(candidate.rowid).or_default() +=
                         weight * reciprocal_rank_score(rank, RRF_K);
                 }
             }
 
-            for (view_index, ranked_rowids) in
-                fts_ranked_candidates(conn, &query, retrieval_limit)?
-                    .into_iter()
-                    .enumerate()
-            {
-                let weight = lexical_view_weight(view_index);
-                for (rank, rowid) in ranked_rowids.into_iter().enumerate() {
+            for ranked_rowids in fts_ranked_candidates(conn, &query, retrieval_limit)? {
+                for (rank, rowid) in ranked_rowids.rowids.into_iter().enumerate() {
                     *fused_scores.entry(rowid).or_default() +=
-                        weight * reciprocal_rank_score(rank, RRF_K);
+                        ranked_rowids.weight * reciprocal_rank_score(rank, RRF_K);
                 }
             }
             if fused_scores.is_empty() {
@@ -730,7 +831,7 @@ impl MemoryStore for SqliteMemoryStore {
                 .collect::<Vec<_>>()
                 .join(",");
             let fetch_sql = format!(
-                "SELECT rowid, id, content, retrieval_text, wing, room, source_file, chunk_index, added_by, filed_at, embedding
+                "SELECT rowid, id, content, retrieval_text, content_kind, wing, room, source_file, chunk_index, added_by, filed_at, embedding
                  FROM drawers WHERE rowid IN ({rowid_list})"
             );
             let mut fetch_stmt = conn.prepare(&fetch_sql)?;
@@ -739,7 +840,7 @@ impl MemoryStore for SqliteMemoryStore {
 
             while let Some(row) = fetched_rows.next()? {
                 let rowid: i64 = row.get(0)?;
-                let embedding: Vec<u8> = row.get(10)?;
+                let embedding: Vec<u8> = row.get(11)?;
                 let score = cosine_similarity_blob(original_query_vector, &embedding)?;
                 let relevance = fused_scores[&rowid];
                 hits.push(SearchHit {
@@ -994,12 +1095,16 @@ fn row_to_drawer_offset(
         content: row.get(offset + 1)?,
         retrieval_text: row.get(offset + 2)?,
         metadata: DrawerMetadata {
-            wing: row.get(offset + 3)?,
-            room: row.get(offset + 4)?,
-            source_file: row.get(offset + 5)?,
-            chunk_index: row.get(offset + 6)?,
-            added_by: row.get(offset + 7)?,
-            filed_at: row.get(offset + 8)?,
+            content_kind: row
+                .get::<_, String>(offset + 3)?
+                .parse()
+                .unwrap_or(ContentKind::Unknown),
+            wing: row.get(offset + 4)?,
+            room: row.get(offset + 5)?,
+            source_file: row.get(offset + 6)?,
+            chunk_index: row.get(offset + 7)?,
+            added_by: row.get(offset + 8)?,
+            filed_at: row.get(offset + 9)?,
         },
     })
 }
@@ -1014,10 +1119,14 @@ fn embedding_input(
     content: &str,
     retrieval_text: Option<&str>,
     source_file: Option<&str>,
+    content_kind: ContentKind,
 ) -> String {
     const MAX_IDENTIFIER_TOKENS: usize = 48;
 
     let body = retrieval_text.unwrap_or(content);
+    if content_kind != ContentKind::Code {
+        return body.to_owned();
+    }
     let source = source_file.map(compact_source_path).unwrap_or_default();
     let mut seen = HashSet::new();
     let mut identifiers = Vec::new();
@@ -1060,18 +1169,49 @@ fn compact_source_path(source_file: &str) -> String {
     components.join("/")
 }
 
-fn query_embedding_views(query: &str) -> Vec<String> {
-    const MAX_VIEWS: usize = 3;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QueryViewTarget {
+    All,
+    Code,
+    General,
+}
 
+impl QueryViewTarget {
+    fn applies_to(self, content_kind: ContentKind) -> bool {
+        match self {
+            Self::All => true,
+            Self::Code => content_kind == ContentKind::Code,
+            Self::General => content_kind != ContentKind::Code,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct QueryView {
+    text: String,
+    target: QueryViewTarget,
+    weight: f32,
+}
+
+fn query_embedding_views(query: &str) -> Vec<QueryView> {
     let original_tokens = identifier_tokens(query);
-    let mut views = vec![query.to_owned()];
+    let mut views = vec![QueryView {
+        text: query.to_owned(),
+        target: QueryViewTarget::All,
+        weight: 1.0,
+    }];
     if original_tokens.len() < 2 {
         return views;
     }
 
     let canonical_tokens = canonical_query_tokens(&original_tokens);
     let concepts = semantic_concept_tokens(&original_tokens);
-    push_unique_nonempty(&mut views, canonical_tokens.join(" "));
+    push_unique_query_view(
+        &mut views,
+        canonical_tokens.join(" "),
+        QueryViewTarget::Code,
+        0.65,
+    );
 
     if !concepts.is_empty() {
         let mut concept_terms = concepts.clone();
@@ -1080,36 +1220,97 @@ fn query_embedding_views(query: &str) -> Vec<String> {
                 .windows(2)
                 .map(|pair| format!("{}{}", pair[0], pair[1])),
         );
-        push_unique_nonempty(&mut views, concept_terms.join(" "));
+        push_unique_query_view(
+            &mut views,
+            concept_terms.join(" "),
+            QueryViewTarget::Code,
+            0.8,
+        );
     }
 
-    views.truncate(MAX_VIEWS);
+    let general_tokens = general_query_tokens(&original_tokens);
+    push_unique_query_view(
+        &mut views,
+        general_tokens.join(" "),
+        QueryViewTarget::General,
+        0.8,
+    );
     views
 }
 
-fn push_unique_nonempty(values: &mut Vec<String>, value: String) {
-    if !value.trim().is_empty() && !values.iter().any(|existing| existing == &value) {
-        values.push(value);
+fn push_unique_query_view(
+    views: &mut Vec<QueryView>,
+    text: String,
+    target: QueryViewTarget,
+    weight: f32,
+) {
+    if !text.trim().is_empty()
+        && !views
+            .iter()
+            .any(|existing| existing.text == text && existing.target == target)
+    {
+        views.push(QueryView {
+            text,
+            target,
+            weight,
+        });
     }
 }
 
-fn embedding_view_weight(view_index: usize) -> f32 {
-    match view_index {
-        0 => 1.0,
-        1 => 0.65,
-        _ => 0.8,
-    }
+fn general_query_tokens(tokens: &[String]) -> Vec<String> {
+    tokens
+        .iter()
+        .filter(|token| !is_recall_scaffold(token))
+        .cloned()
+        .collect()
 }
 
-fn lexical_view_weight(view_index: usize) -> f32 {
-    if view_index == 0 { 0.9 } else { 1.2 }
+fn is_recall_scaffold(token: &str) -> bool {
+    matches!(
+        token,
+        "can"
+            | "could"
+            | "you"
+            | "your"
+            | "my"
+            | "me"
+            | "do"
+            | "did"
+            | "have"
+            | "please"
+            | "remind"
+            | "remember"
+            | "previous"
+            | "previously"
+            | "conversation"
+            | "chat"
+            | "again"
+            | "before"
+            | "exactly"
+            | "said"
+            | "told"
+            | "suggest"
+            | "suggested"
+            | "recommend"
+            | "recommended"
+            | "tips"
+            | "advice"
+    )
+}
+
+#[derive(Debug)]
+struct RankedRowids {
+    rowids: Vec<i64>,
+    weight: f32,
 }
 
 fn fts_ranked_candidates(
     conn: &Connection,
     query: &SearchQuery,
     limit: usize,
-) -> Result<Vec<Vec<i64>>> {
+) -> Result<Vec<RankedRowids>> {
+    const METADATA_BATCH_SIZE: usize = 512;
+
     let fts_exists: bool = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'drawers_fts')",
         [],
@@ -1118,21 +1319,6 @@ fn fts_ranked_candidates(
     if !fts_exists {
         return Ok(Vec::new());
     }
-
-    let allowed_rowids = if SqliteMemoryStore::search_condition(query).is_some() {
-        let sql = format!(
-            "SELECT rowid FROM drawers {}",
-            SqliteMemoryStore::search_filter_clause(query)
-        );
-        let mut statement = conn.prepare(&sql)?;
-        Some(
-            statement
-                .query_map([], |row| row.get::<_, i64>(0))?
-                .collect::<std::result::Result<HashSet<_>, _>>()?,
-        )
-    } else {
-        None
-    };
 
     // Keep FTS5's optimized rank traversal independent from the metadata
     // lookup. Joining before ordering makes broad prefix queries pathological,
@@ -1145,38 +1331,120 @@ fn fts_ranked_candidates(
          WHERE drawers_fts MATCH ?1
          ORDER BY rank",
     )?;
+    let has_code_candidates = target_has_candidates(conn, query, QueryViewTarget::Code)?;
+    let has_general_candidates = target_has_candidates(conn, query, QueryViewTarget::General)?;
     let mut ranked_views = Vec::new();
-    for fts_query in fts_query_views(&query.query) {
-        let mut rows = statement.query(params![fts_query])?;
+    for view in fts_query_views(&query.query) {
+        let target_exists = match view.target {
+            QueryViewTarget::All => true,
+            QueryViewTarget::Code => has_code_candidates,
+            QueryViewTarget::General => has_general_candidates,
+        };
+        if !target_exists {
+            continue;
+        }
+        let mut rows = statement.query(params![view.text])?;
         let mut rowids = Vec::with_capacity(limit);
+        let mut pending = Vec::with_capacity(METADATA_BATCH_SIZE);
         while let Some(row) = rows.next()? {
-            let rowid = row.get::<_, i64>(0)?;
-            if allowed_rowids
-                .as_ref()
-                .is_none_or(|allowed| allowed.contains(&rowid))
-            {
-                rowids.push(rowid);
-                if rowids.len() == limit {
-                    break;
-                }
+            pending.push(row.get::<_, i64>(0)?);
+            if pending.len() < METADATA_BATCH_SIZE {
+                continue;
+            }
+            append_eligible_fts_rowids(conn, query, view.target, &pending, limit, &mut rowids)?;
+            pending.clear();
+            if rowids.len() == limit {
+                break;
             }
         }
-        ranked_views.push(rowids);
+        if rowids.len() < limit && !pending.is_empty() {
+            append_eligible_fts_rowids(conn, query, view.target, &pending, limit, &mut rowids)?;
+        }
+        ranked_views.push(RankedRowids {
+            rowids,
+            weight: view.weight,
+        });
     }
     Ok(ranked_views)
 }
 
-fn fts_query_views(query: &str) -> Vec<String> {
+fn target_has_candidates(
+    conn: &Connection,
+    query: &SearchQuery,
+    target: QueryViewTarget,
+) -> Result<bool> {
+    let kind_condition = match target {
+        QueryViewTarget::All => "1 = 1",
+        QueryViewTarget::Code => "content_kind = 'code'",
+        QueryViewTarget::General => "content_kind != 'code'",
+    };
+    let metadata_filter = SqliteMemoryStore::search_condition_for(query, "")
+        .map(|condition| format!("{condition} AND "))
+        .unwrap_or_default();
+    let sql = format!(
+        "SELECT EXISTS(SELECT 1 FROM drawers WHERE {metadata_filter}{kind_condition} LIMIT 1)"
+    );
+    Ok(conn.query_row(&sql, [], |row| row.get(0))?)
+}
+
+fn append_eligible_fts_rowids(
+    conn: &Connection,
+    query: &SearchQuery,
+    target: QueryViewTarget,
+    ranked_batch: &[i64],
+    limit: usize,
+    output: &mut Vec<i64>,
+) -> Result<()> {
+    let rowid_list = ranked_batch
+        .iter()
+        .map(i64::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let metadata_filter = SqliteMemoryStore::search_condition_for(query, "")
+        .map(|condition| format!(" AND {condition}"))
+        .unwrap_or_default();
+    let sql = format!(
+        "SELECT rowid, content_kind FROM drawers WHERE rowid IN ({rowid_list}){metadata_filter}"
+    );
+    let mut statement = conn.prepare(&sql)?;
+    let metadata = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let eligible = metadata
+        .into_iter()
+        .filter_map(|(rowid, kind)| {
+            target
+                .applies_to(kind.parse().unwrap_or(ContentKind::Unknown))
+                .then_some(rowid)
+        })
+        .collect::<HashSet<_>>();
+
+    for rowid in ranked_batch {
+        if eligible.contains(rowid) {
+            output.push(*rowid);
+            if output.len() == limit {
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn fts_query_views(query: &str) -> Vec<QueryView> {
     let tokens = identifier_tokens(query);
     let mut views = Vec::new();
     if !tokens.is_empty() {
-        views.push(
-            tokens
+        views.push(QueryView {
+            text: tokens
                 .iter()
                 .map(|token| format!("{token}*"))
                 .collect::<Vec<_>>()
                 .join(" OR "),
-        );
+            target: QueryViewTarget::All,
+            weight: 0.9,
+        });
     }
 
     if tokens.len() < 2 {
@@ -1193,7 +1461,24 @@ fn fts_query_views(query: &str) -> Vec<String> {
             terms.push(format!("{}{}*", pair[0], pair[1]));
             terms.push(format!("\"{} {}\"", pair[0], pair[1]));
         }
-        views.push(terms.join(" OR "));
+        views.push(QueryView {
+            text: terms.join(" OR "),
+            target: QueryViewTarget::Code,
+            weight: 1.2,
+        });
+    }
+
+    let general_tokens = general_query_tokens(&tokens);
+    if general_tokens.len() >= 2 && general_tokens != tokens {
+        views.push(QueryView {
+            text: general_tokens
+                .iter()
+                .map(|token| format!("{token}*"))
+                .collect::<Vec<_>>()
+                .join(" OR "),
+            target: QueryViewTarget::General,
+            weight: 1.1,
+        });
     }
     views
 }
@@ -1262,26 +1547,32 @@ fn synonym_canonical(token: &str) -> Option<&'static str> {
 // --- Reranking ---
 
 fn rerank_search_hits(hits: &mut [SearchHit], query: &SearchQuery) {
-    let mut tokens = identifier_tokens(&query.query);
-    let concepts = if tokens.len() >= 2 {
-        semantic_concept_tokens(&tokens)
+    let query_tokens = identifier_tokens(&query.query);
+    let mut code_tokens = query_tokens.clone();
+    let concepts = if code_tokens.len() >= 2 {
+        semantic_concept_tokens(&code_tokens)
     } else {
         Vec::new()
     };
     for concept in &concepts {
-        if !tokens.contains(concept) {
-            tokens.push(concept.clone());
+        if !code_tokens.contains(concept) {
+            code_tokens.push(concept.clone());
         }
     }
-    let mut variants = identifier_variants(&identifier_tokens(&query.query));
+    let mut variants = identifier_variants(&query_tokens);
     for variant in identifier_variants(&concepts) {
         if !variants.contains(&variant) {
             variants.push(variant);
         }
     }
+    let temporal_target = temporal_target_date(&query.query, query.as_of.as_deref());
 
     for hit in hits.iter_mut() {
-        hit.relevance = boosted_score(hit, &tokens, &variants);
+        hit.relevance = if hit.drawer.metadata.content_kind == ContentKind::Code {
+            boosted_code_score(hit, &code_tokens, &variants)
+        } else {
+            boosted_general_score(hit, &query_tokens, temporal_target)
+        };
     }
     normalize_relevance_scores(hits);
 
@@ -1311,7 +1602,7 @@ fn normalize_relevance_scores(hits: &mut [SearchHit]) {
     }
 }
 
-fn boosted_score(hit: &SearchHit, tokens: &[String], variants: &[String]) -> f32 {
+fn boosted_code_score(hit: &SearchHit, tokens: &[String], variants: &[String]) -> f32 {
     let mut score = hit.relevance;
     let content = hit.drawer.content.to_ascii_lowercase();
     let source_file = hit
@@ -1374,6 +1665,215 @@ fn boosted_score(hit: &SearchHit, tokens: &[String], variants: &[String]) -> f32
     }
 
     score
+}
+
+fn boosted_general_score(
+    hit: &SearchHit,
+    query_tokens: &[String],
+    temporal_target: Option<NaiveDate>,
+) -> f32 {
+    let mut score = hit.relevance;
+    let body = hit
+        .drawer
+        .retrieval_text
+        .as_deref()
+        .unwrap_or(&hit.drawer.content);
+    let body_lower = body.to_ascii_lowercase();
+    let body_tokens = identifier_tokens(body).into_iter().collect::<HashSet<_>>();
+    let core_tokens = general_query_tokens(query_tokens);
+    let overlap = core_tokens
+        .iter()
+        .filter(|token| body_tokens.contains(*token))
+        .count();
+
+    if !core_tokens.is_empty() {
+        score += 0.035 * overlap.min(8) as f32;
+        if overlap >= 2 {
+            score += 0.12 * (overlap as f32 / core_tokens.len() as f32).min(1.0);
+        }
+    }
+
+    let phrase_match = core_tokens.windows(2).any(|pair| {
+        body_lower.contains(&format!("{} {}", pair[0], pair[1]))
+            || body_lower.contains(&format!("{}-{}", pair[0], pair[1]))
+    });
+    if phrase_match {
+        score += 0.08;
+    }
+
+    if hit.drawer.metadata.content_kind == ContentKind::Documentation {
+        let source = hit
+            .drawer
+            .metadata
+            .source_file
+            .as_deref()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let source_tokens = identifier_tokens(&source)
+            .into_iter()
+            .collect::<HashSet<_>>();
+        let source_overlap = core_tokens
+            .iter()
+            .filter(|token| source_tokens.contains(*token))
+            .count();
+        score += 0.04 * source_overlap.min(3) as f32;
+    }
+
+    if preference_intent(query_tokens) && overlap > 0 && contains_preference_span(&body_lower) {
+        score += 0.18;
+    }
+
+    if let (Some(target), Some(filed_at)) =
+        (temporal_target, hit.drawer.metadata.filed_at.as_deref())
+        && let Some(candidate_date) = parse_memory_date(filed_at)
+    {
+        let distance = (candidate_date - target).num_days().unsigned_abs();
+        score += match distance {
+            0 => 0.45,
+            1 => 0.35,
+            2..=3 => 0.2,
+            4..=7 => 0.1,
+            8..=14 => 0.04,
+            _ => 0.0,
+        };
+    }
+
+    score
+}
+
+fn parse_memory_date(value: &str) -> Option<NaiveDate> {
+    DateTime::<FixedOffset>::parse_from_rfc3339(value)
+        .ok()
+        .map(|date_time| date_time.date_naive())
+        .or_else(|| {
+            value
+                .split(" (")
+                .next()
+                .and_then(|date| NaiveDate::parse_from_str(date, "%Y/%m/%d").ok())
+        })
+        .or_else(|| {
+            value
+                .get(..10)
+                .and_then(|date| NaiveDate::parse_from_str(date, "%Y-%m-%d").ok())
+        })
+}
+
+fn temporal_target_date(query: &str, as_of: Option<&str>) -> Option<NaiveDate> {
+    let reference = parse_memory_date(as_of?)?;
+    let tokens = query
+        .to_ascii_lowercase()
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+
+    if tokens.iter().any(|token| token == "yesterday") {
+        return Some(reference - Duration::days(1));
+    }
+
+    if let Some(index) = tokens.iter().position(|token| token == "last")
+        && let Some(weekday) = tokens.get(index + 1).and_then(|token| parse_weekday(token))
+    {
+        let current = reference.weekday().num_days_from_monday() as i64;
+        let desired = weekday.num_days_from_monday() as i64;
+        let days_back = match (current - desired).rem_euclid(7) {
+            0 => 7,
+            days => days,
+        };
+        return Some(reference - Duration::days(days_back));
+    }
+
+    for window in tokens.windows(3) {
+        if window[2] != "ago" {
+            continue;
+        }
+        let Some(amount) = parse_count(&window[0]) else {
+            continue;
+        };
+        let days = match window[1].trim_end_matches('s') {
+            "day" => amount,
+            "week" => amount.saturating_mul(7),
+            "month" => amount.saturating_mul(30),
+            "year" => amount.saturating_mul(365),
+            _ => continue,
+        };
+        return reference.checked_sub_signed(Duration::try_days(days)?);
+    }
+
+    None
+}
+
+fn parse_count(value: &str) -> Option<i64> {
+    value.parse().ok().or_else(|| {
+        Some(match value {
+            "one" => 1,
+            "two" => 2,
+            "three" => 3,
+            "four" => 4,
+            "five" => 5,
+            "six" => 6,
+            "seven" => 7,
+            "eight" => 8,
+            "nine" => 9,
+            "ten" => 10,
+            "eleven" => 11,
+            "twelve" => 12,
+            _ => return None,
+        })
+    })
+}
+
+fn parse_weekday(value: &str) -> Option<Weekday> {
+    match value {
+        "monday" => Some(Weekday::Mon),
+        "tuesday" => Some(Weekday::Tue),
+        "wednesday" => Some(Weekday::Wed),
+        "thursday" => Some(Weekday::Thu),
+        "friday" => Some(Weekday::Fri),
+        "saturday" => Some(Weekday::Sat),
+        "sunday" => Some(Weekday::Sun),
+        _ => None,
+    }
+}
+
+fn preference_intent(tokens: &[String]) -> bool {
+    tokens.iter().any(|token| {
+        matches!(
+            token.as_str(),
+            "prefer"
+                | "preferred"
+                | "preference"
+                | "favorite"
+                | "favourite"
+                | "recommend"
+                | "recommended"
+                | "suggest"
+                | "suggested"
+                | "advice"
+                | "tips"
+                | "concern"
+        )
+    })
+}
+
+fn contains_preference_span(body: &str) -> bool {
+    [
+        "i prefer",
+        "i'd prefer",
+        "i would prefer",
+        "i like",
+        "i love",
+        "i hate",
+        "i avoid",
+        "i want",
+        "i need",
+        "my favorite",
+        "my favourite",
+        "important to me",
+        "my concern",
+    ]
+    .iter()
+    .any(|span| body.contains(span))
 }
 
 fn identifier_tokens(text: &str) -> Vec<String> {
@@ -1552,10 +2052,11 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        CURRENT_EMBEDDING_REPRESENTATION, Drawer, DrawerMetadata, EMBEDDING_REPRESENTATION_KEY,
-        MemoryStore, SearchHit, SearchQuery, SqliteMemoryStore, fts_ranked_candidates,
-        identifier_tokens, identifier_variants, rerank_search_hits, stored_embedding_model,
-        stored_embedding_representation,
+        CURRENT_EMBEDDING_REPRESENTATION, ContentKind, Drawer, DrawerMetadata,
+        EMBEDDING_REPRESENTATION_KEY, MemoryStore, SearchHit, SearchQuery, SqliteMemoryStore,
+        embedding_input, fts_ranked_candidates, identifier_tokens, identifier_variants,
+        rerank_search_hits, stored_embedding_model, stored_embedding_representation,
+        temporal_target_date,
     };
 
     fn drawer(id: &str, content: &str, wing: &str, room: &str) -> Drawer {
@@ -1564,6 +2065,7 @@ mod tests {
             content: content.to_owned(),
             retrieval_text: None,
             metadata: DrawerMetadata {
+                content_kind: ContentKind::Code,
                 wing: wing.to_owned(),
                 room: room.to_owned(),
                 source_file: Some(format!("{id}.txt")),
@@ -1572,6 +2074,286 @@ mod tests {
                 filed_at: Some("2026-04-08T00:00:00".to_owned()),
             },
         }
+    }
+
+    #[tokio::test]
+    async fn content_kind_round_trips_through_the_store() {
+        let tmp = tempdir().unwrap();
+        let store = SqliteMemoryStore::new_for_tests(tmp.path());
+        let mut conversation = drawer(
+            "conversation",
+            "User: I prefer compact status updates.",
+            "sessions",
+            "2026",
+        );
+        conversation.metadata.content_kind = ContentKind::Conversation;
+
+        store.add_drawer(conversation).await.unwrap();
+
+        let fetched = store.get_drawer("conversation").await.unwrap().unwrap();
+        assert_eq!(fetched.metadata.content_kind, ContentKind::Conversation);
+        let listed = store.list_drawers(Some("sessions")).await.unwrap();
+        assert_eq!(listed[0].metadata.content_kind, ContentKind::Conversation);
+        let searched = store
+            .search(SearchQuery::new("compact status updates"))
+            .await
+            .unwrap();
+        assert_eq!(
+            searched[0].drawer.metadata.content_kind,
+            ContentKind::Conversation
+        );
+    }
+
+    #[tokio::test]
+    async fn general_search_ignores_request_scaffolding() {
+        let tmp = tempdir().unwrap();
+        let store = SqliteMemoryStore::new_for_tests(tmp.path());
+        let mut target = drawer(
+            "target",
+            "I prefer the ceramic espresso grinder for quiet mornings.",
+            "sessions",
+            "2026",
+        );
+        target.metadata.content_kind = ContentKind::Conversation;
+        let mut distractor = drawer(
+            "distractor",
+            "Can you remind me about our previous conversation again?",
+            "sessions",
+            "2026",
+        );
+        distractor.metadata.content_kind = ContentKind::Conversation;
+        store.add_drawers(vec![distractor, target]).await.unwrap();
+
+        let results = store
+            .search(SearchQuery::new(
+                "Can you remind me which espresso grinder I preferred before?",
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(results[0].drawer.id, "target");
+    }
+
+    #[tokio::test]
+    async fn assistant_recall_can_use_retrieval_text_without_changing_content() {
+        let tmp = tempdir().unwrap();
+        let store = SqliteMemoryStore::new_for_tests(tmp.path());
+        let mut target = drawer(
+            "target",
+            "User asked for workplace posture resources.",
+            "sessions",
+            "2026",
+        );
+        target.metadata.content_kind = ContentKind::Conversation;
+        target.retrieval_text = Some(
+            "user: workplace posture resources\nassistant: recommended the Mayo Clinic posture video"
+                .to_owned(),
+        );
+        let mut distractor = drawer(
+            "distractor",
+            "User watched a general travel video.",
+            "sessions",
+            "2026",
+        );
+        distractor.metadata.content_kind = ContentKind::Conversation;
+        store.add_drawers(vec![distractor, target]).await.unwrap();
+
+        let results = store
+            .search(SearchQuery::new(
+                "Which Mayo Clinic workplace posture video did you recommend?",
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(results[0].drawer.id, "target");
+        assert_eq!(
+            results[0].drawer.content,
+            "User asked for workplace posture resources."
+        );
+    }
+
+    #[tokio::test]
+    async fn temporal_search_uses_explicit_reference_time() {
+        let tmp = tempdir().unwrap();
+        let store = SqliteMemoryStore::new_for_tests(tmp.path());
+        let mut target = drawer(
+            "target",
+            "I bought a countertop ice maker for the kitchen.",
+            "sessions",
+            "2026",
+        );
+        target.metadata.content_kind = ContentKind::Conversation;
+        target.metadata.filed_at = Some("2026-07-05T12:00:00Z".to_owned());
+        let mut distractor = drawer(
+            "distractor",
+            "Which kitchen appliance should I buy next?",
+            "sessions",
+            "2026",
+        );
+        distractor.metadata.content_kind = ContentKind::Conversation;
+        distractor.metadata.filed_at = Some("2026-07-15T12:00:00Z".to_owned());
+        store.add_drawers(vec![distractor, target]).await.unwrap();
+
+        let mut query = SearchQuery::new("What kitchen appliance did I buy 10 days ago?");
+        query.as_of = Some("2026-07-15T18:00:00+08:00".to_owned());
+        let results = store.search(query).await.unwrap();
+
+        assert_eq!(results[0].drawer.id, "target");
+    }
+
+    #[test]
+    fn embedding_representation_is_content_aware() {
+        let conversation = embedding_input(
+            "User: I prefer compact status updates.",
+            None,
+            Some("sessions/2026/turn.jsonl"),
+            ContentKind::Conversation,
+        );
+        assert_eq!(conversation, "User: I prefer compact status updates.");
+
+        let code = embedding_input(
+            "fn process_first_join() {}",
+            None,
+            Some("crates/emulator/src/first_join.rs"),
+            ContentKind::Code,
+        );
+        assert!(code.contains("source: crates/emulator/src/first_join.rs"));
+        assert!(code.contains("identifiers:"));
+        assert!(code.ends_with("fn process_first_join() {}"));
+
+        let unknown = embedding_input(
+            "A neutral legacy memory.",
+            None,
+            Some("legacy/source.rs"),
+            ContentKind::Unknown,
+        );
+        assert_eq!(unknown, "A neutral legacy memory.");
+    }
+
+    #[tokio::test]
+    async fn legacy_schema_migrates_content_kind_to_unknown() {
+        let tmp = tempdir().unwrap();
+        let conn = rusqlite::Connection::open(tmp.path().join("store.sqlite3")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE drawers (
+                id TEXT PRIMARY KEY,
+                content TEXT NOT NULL,
+                retrieval_text TEXT,
+                wing TEXT NOT NULL,
+                room TEXT NOT NULL,
+                source_file TEXT,
+                chunk_index INTEGER NOT NULL DEFAULT 0,
+                added_by TEXT NOT NULL,
+                filed_at TEXT,
+                embedding BLOB NOT NULL
+             );
+             CREATE TABLE store_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO drawers (id, content, wing, room, added_by, embedding)
+             VALUES ('legacy', 'old memory', 'old', 'notes', 'test', ?1)",
+            params![super::vector_to_blob(&vec![0.0; 128])],
+        )
+        .unwrap();
+        drop(conn);
+
+        let store = SqliteMemoryStore::new_for_tests(tmp.path());
+
+        let legacy = store.get_drawer("legacy").await.unwrap().unwrap();
+        assert_eq!(legacy.metadata.content_kind, ContentKind::Unknown);
+    }
+
+    #[tokio::test]
+    async fn legacy_schema_backfills_recognizable_content_kinds() {
+        let tmp = tempdir().unwrap();
+        let conn = rusqlite::Connection::open(tmp.path().join("store.sqlite3")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE drawers (
+                id TEXT PRIMARY KEY,
+                content TEXT NOT NULL,
+                retrieval_text TEXT,
+                wing TEXT NOT NULL,
+                room TEXT NOT NULL,
+                source_file TEXT,
+                chunk_index INTEGER NOT NULL DEFAULT 0,
+                added_by TEXT NOT NULL,
+                filed_at TEXT,
+                embedding BLOB NOT NULL
+             );
+             CREATE TABLE store_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
+        )
+        .unwrap();
+        let embedding = super::vector_to_blob(&vec![0.0; 128]);
+        conn.execute(
+            "INSERT INTO drawers (id, content, wing, room, source_file, added_by, embedding)
+             VALUES ('code', 'fn main() {}', 'project', 'src', 'src/main.rs', 'test', ?1)",
+            params![&embedding],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO drawers (id, content, wing, room, source_file, added_by, embedding)
+             VALUES ('chat', 'user and assistant', 'codex-sessions', '2026',
+                     '2026/transcript.md', 'test', ?1)",
+            params![&embedding],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO drawers (id, content, wing, room, source_file, added_by, embedding)
+             VALUES ('chat-code', 'fn main() {}', 'chat-server', 'session-runtime',
+                     'src/main.rs', 'test', ?1)",
+            params![&embedding],
+        )
+        .unwrap();
+        drop(conn);
+
+        let store = SqliteMemoryStore::new_for_tests(tmp.path());
+
+        assert_eq!(
+            store
+                .get_drawer("code")
+                .await
+                .unwrap()
+                .unwrap()
+                .metadata
+                .content_kind,
+            ContentKind::Code
+        );
+        assert_eq!(
+            store
+                .get_drawer("chat")
+                .await
+                .unwrap()
+                .unwrap()
+                .metadata
+                .content_kind,
+            ContentKind::Conversation
+        );
+        assert_eq!(
+            store
+                .get_drawer("chat-code")
+                .await
+                .unwrap()
+                .unwrap()
+                .metadata
+                .content_kind,
+            ContentKind::Code
+        );
+    }
+
+    #[test]
+    fn temporal_counts_outside_chrono_range_are_ignored() {
+        assert_eq!(
+            temporal_target_date(
+                "what happened 9223372036854775807 days ago",
+                Some("2026-07-15"),
+            ),
+            None
+        );
+        assert_eq!(
+            temporal_target_date("a while ago, specifically 10 days ago", Some("2026-07-15"),),
+            chrono::NaiveDate::from_ymd_opt(2026, 7, 5)
+        );
     }
 
     #[tokio::test]
@@ -1779,7 +2561,7 @@ mod tests {
                 assert!(
                     ranked_views
                         .iter()
-                        .all(|ranked| ranked.as_slice() == [target_rowid])
+                        .all(|ranked| ranked.rowids.as_slice() == [target_rowid])
                 );
                 Ok(())
             })
@@ -2158,6 +2940,7 @@ mod tests {
                     content: "SELECT first_name FROM users JOIN guilds ON true".to_owned(),
                     retrieval_text: None,
                     metadata: DrawerMetadata {
+                        content_kind: ContentKind::Code,
                         wing: "reforged".to_owned(),
                         room: "crates".to_owned(),
                         source_file: Some(
@@ -2180,6 +2963,7 @@ mod tests {
                             .to_owned(),
                     retrieval_text: None,
                     metadata: DrawerMetadata {
+                        content_kind: ContentKind::Code,
                         wing: "reforged".to_owned(),
                         room: "crates".to_owned(),
                         source_file: Some(

@@ -6,7 +6,8 @@ use std::{
 
 use chrono::Utc;
 use mempalace_core::{
-    Drawer, DrawerMetadata, KnowledgeGraph, MemoryStore, MempalaceConfig, SearchQuery,
+    ContentKind, Drawer, DrawerMetadata, KnowledgeGraph, MemoryStore, MempalaceConfig,
+    RetrievalContext, SearchQuery, retrieval_text_for_content,
 };
 use mempalace_store::SqliteMemoryStore;
 use rmcp::{
@@ -77,6 +78,8 @@ struct SearchRequest {
     limit: Option<usize>,
     wing: Option<String>,
     room: Option<String>,
+    /// Reference time for relative phrases such as "10 days ago".
+    as_of: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -92,6 +95,8 @@ struct AddDrawerRequest {
     content: String,
     source_file: Option<String>,
     added_by: Option<String>,
+    /// One of: code, conversation, documentation, diary, prose, unknown.
+    content_kind: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -303,11 +308,13 @@ impl McpServer {
         limit: usize,
         wing: Option<String>,
         room: Option<String>,
+        as_of: Option<String>,
     ) -> Result<Value, String> {
         let mut search = SearchQuery::new(query.clone());
         search.limit = limit;
         search.wing = wing.clone();
         search.room = room.clone();
+        search.as_of = as_of.clone();
         let hits = self
             .app
             .store
@@ -322,6 +329,7 @@ impl McpServer {
                     "text": hit.drawer.content,
                     "wing": hit.drawer.metadata.wing,
                     "room": hit.drawer.metadata.room,
+                    "content_kind": hit.drawer.metadata.content_kind.to_string(),
                     "source_file": hit.drawer.metadata.source_file.as_deref().and_then(file_name).unwrap_or("?"),
                     "relevance": round3(hit.relevance),
                     "similarity": round3(hit.score),
@@ -331,7 +339,7 @@ impl McpServer {
 
         Ok(json!({
             "query": query,
-            "filters": {"wing": wing, "room": room},
+            "filters": {"wing": wing, "room": room, "as_of": as_of},
             "results": results,
         }))
     }
@@ -377,6 +385,7 @@ impl McpServer {
         content: String,
         source_file: Option<String>,
         added_by: String,
+        content_kind: ContentKind,
     ) -> Result<Value, String> {
         let duplicate = self.tool_check_duplicate(content.clone(), 0.9).await?;
         if duplicate
@@ -392,17 +401,31 @@ impl McpServer {
         }
 
         let drawer_id = format!("drawer_{}_{}_{}", wing, room, Uuid::now_v7().simple());
+        let filed_at = Utc::now().to_rfc3339();
+        let retrieval_text = retrieval_text_for_content(
+            content_kind,
+            RetrievalContext {
+                path: source_file.as_deref(),
+                wing: &wing,
+                room: &room,
+                agent: &added_by,
+                filed_at: Some(&filed_at),
+            },
+            &content,
+            &content,
+        );
         let drawer = Drawer {
             id: drawer_id.clone(),
             content,
-            retrieval_text: None,
+            retrieval_text,
             metadata: DrawerMetadata {
+                content_kind,
                 wing: wing.clone(),
                 room: room.clone(),
                 source_file,
                 chunk_index: 0,
                 added_by,
-                filed_at: Some(Utc::now().to_rfc3339()),
+                filed_at: Some(filed_at),
             },
         };
         self.app
@@ -416,6 +439,7 @@ impl McpServer {
             "drawer_id": drawer_id,
             "wing": wing,
             "room": room,
+            "content_kind": content_kind.to_string(),
         }))
     }
 
@@ -546,17 +570,32 @@ impl McpServer {
         let wing = format!("wing_{}", slugify(&agent_name));
         let now = Utc::now();
         let entry_id = format!("diary_{}_{}", wing, Uuid::now_v7().simple());
+        let source_file = format!("diary/{topic}");
+        let filed_at = now.to_rfc3339();
+        let retrieval_text = retrieval_text_for_content(
+            ContentKind::Diary,
+            RetrievalContext {
+                path: Some(&source_file),
+                wing: &wing,
+                room: &topic,
+                agent: &agent_name,
+                filed_at: Some(&filed_at),
+            },
+            &entry,
+            &entry,
+        );
         let drawer = Drawer {
             id: entry_id.clone(),
             content: entry,
-            retrieval_text: None,
+            retrieval_text,
             metadata: DrawerMetadata {
+                content_kind: ContentKind::Diary,
                 wing: wing.clone(),
                 room: "diary".to_owned(),
-                source_file: Some(format!("diary/{topic}")),
+                source_file: Some(source_file),
                 chunk_index: 0,
                 added_by: agent_name.clone(),
-                filed_at: Some(now.to_rfc3339()),
+                filed_at: Some(filed_at),
             },
         };
         self.app
@@ -836,7 +875,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "Hybrid semantic search using dense embeddings, bounded code-domain query expansion, and indexed FTS5 ranking. Returns verbatim drawer content with fused relevance and original-query cosine similarity scores."
+        description = "Content-aware hybrid semantic search using dense embeddings, bounded query views, optional temporal reference time, and indexed FTS5 ranking. Returns verbatim drawer content, content kind, fused relevance, and original-query cosine similarity."
     )]
     async fn mempalace_search(&self, Parameters(request): Parameters<SearchRequest>) -> McpResult {
         self.tool_search(
@@ -844,6 +883,7 @@ impl McpServer {
             request.limit.unwrap_or(5),
             request.wing,
             request.room,
+            request.as_of,
         )
         .await
         .map(Json)
@@ -866,12 +906,19 @@ impl McpServer {
         &self,
         Parameters(request): Parameters<AddDrawerRequest>,
     ) -> McpResult {
+        let content_kind = request
+            .content_kind
+            .as_deref()
+            .unwrap_or("unknown")
+            .parse::<ContentKind>()
+            .map_err(invalid_params)?;
         self.tool_add_drawer(
             request.wing,
             request.room,
             request.content,
             request.source_file,
             request.added_by.unwrap_or_else(|| "mcp".to_owned()),
+            content_kind,
         )
         .await
         .map(Json)
@@ -1029,6 +1076,10 @@ impl ServerHandler for McpServer {
 
 fn internal_error(message: impl ToString) -> ErrorData {
     ErrorData::internal_error(message.to_string(), None)
+}
+
+fn invalid_params(message: impl ToString) -> ErrorData {
+    ErrorData::invalid_params(message.to_string(), None)
 }
 
 fn file_name(path: &str) -> Option<&str> {

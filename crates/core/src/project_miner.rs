@@ -11,7 +11,7 @@ use ignore::WalkBuilder;
 use serde::Deserialize;
 use uuid::Uuid;
 
-use crate::{Drawer, DrawerMetadata, MemoryStore, Result};
+use crate::{ContentKind, Drawer, DrawerMetadata, MemoryStore, Result};
 
 const CHUNK_SIZE: usize = 800;
 const CHUNK_OVERLAP: usize = 100;
@@ -73,6 +73,8 @@ const SKIP_FILENAMES: &[&str] = &[
     "mempal.yml",
     ".gitignore",
     "package-lock.json",
+    // Evaluation queries and labels must never become production retrieval text.
+    "multi_domain_queries.json",
 ];
 
 #[derive(Debug, Clone)]
@@ -227,7 +229,32 @@ pub async fn mine_project<S: MemoryStore + ?Sized>(
         }
 
         let room = detect_room(&file, content, routing.as_ref(), &project_path);
-        let chunks = chunk_file(&file, &project_path, content);
+        let content_kind = content_kind_for_path(&file, &wing, &room);
+        let relative_path = file
+            .strip_prefix(&project_path)
+            .unwrap_or(&file)
+            .to_string_lossy()
+            .replace('\\', "/");
+        let chunks = chunk_file(&file, &project_path, content)
+            .into_iter()
+            .map(|mut chunk| {
+                if chunk.retrieval_text.is_none() {
+                    chunk.retrieval_text = retrieval_text_for_content(
+                        content_kind,
+                        RetrievalContext {
+                            path: Some(&relative_path),
+                            wing: &wing,
+                            room: &room,
+                            agent: &options.agent,
+                            filed_at: None,
+                        },
+                        content,
+                        &chunk.content,
+                    );
+                }
+                chunk
+            })
+            .collect::<Vec<_>>();
         if chunks.is_empty() {
             summary.files_skipped += 1;
             if options.log_progress {
@@ -271,6 +298,7 @@ pub async fn mine_project<S: MemoryStore + ?Sized>(
                 content: chunk.content,
                 retrieval_text: chunk.retrieval_text,
                 metadata: DrawerMetadata {
+                    content_kind,
                     wing: wing.clone(),
                     room: room.clone(),
                     source_file: Some(source_file.clone()),
@@ -964,6 +992,166 @@ fn code_retrieval_text(
     )
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct RetrievalContext<'a> {
+    pub path: Option<&'a str>,
+    pub wing: &'a str,
+    pub room: &'a str,
+    pub agent: &'a str,
+    pub filed_at: Option<&'a str>,
+}
+
+pub fn retrieval_text_for_content(
+    content_kind: ContentKind,
+    context: RetrievalContext<'_>,
+    document: &str,
+    chunk: &str,
+) -> Option<String> {
+    let RetrievalContext {
+        path,
+        wing,
+        room,
+        agent,
+        filed_at,
+    } = context;
+    Some(match content_kind {
+        ContentKind::Conversation => conversation_retrieval_text(path, wing, room, chunk),
+        ContentKind::Documentation => documentation_retrieval_text(path, document, chunk),
+        ContentKind::Diary => {
+            let date = filed_at
+                .and_then(valid_date_prefix)
+                .or_else(|| path.and_then(path_date))
+                .unwrap_or("unknown");
+            format!(
+                "kind: diary\ndate: {date}\nagent: {agent}\ntopic: {room}{}\nverbatim:\n{chunk}",
+                source_context(path)
+            )
+        }
+        ContentKind::Prose | ContentKind::Unknown => path.map_or_else(
+            || chunk.to_owned(),
+            |path| format!("kind: prose\nsource: {path}\nverbatim:\n{chunk}"),
+        ),
+        ContentKind::Code => return None,
+    })
+}
+
+fn source_context(path: Option<&str>) -> String {
+    path.map_or_else(String::new, |path| format!("\nsource: {path}"))
+}
+
+fn conversation_retrieval_text(path: Option<&str>, wing: &str, room: &str, chunk: &str) -> String {
+    let mut turns = Vec::new();
+    for line in chunk.lines() {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(line) {
+            collect_conversation_turns(&value, &mut turns);
+        }
+    }
+    turns.dedup();
+
+    let role_context = if turns.is_empty() {
+        String::new()
+    } else {
+        format!("\nroles:\n{}", turns.join("\n"))
+    };
+    format!(
+        "kind: conversation\nsession: {wing}/{room}{}{role_context}\nverbatim:\n{chunk}",
+        source_context(path)
+    )
+}
+
+fn collect_conversation_turns(value: &serde_json::Value, turns: &mut Vec<String>) {
+    match value {
+        serde_json::Value::Object(object) => {
+            if let Some(role) = object.get("role").and_then(serde_json::Value::as_str)
+                && matches!(role, "user" | "assistant" | "system" | "developer" | "tool")
+                && let Some(content) = object.get("content")
+                && let Some(text) = conversation_content_text(content)
+            {
+                turns.push(format!("{role}: {text}"));
+            }
+            for nested in object.values() {
+                collect_conversation_turns(nested, turns);
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for nested in values {
+                collect_conversation_turns(nested, turns);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn conversation_content_text(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(text) => {
+            Some(text.split_whitespace().collect::<Vec<_>>().join(" "))
+        }
+        serde_json::Value::Array(items) => {
+            let text = items
+                .iter()
+                .filter_map(|item| {
+                    item.get("text")
+                        .and_then(serde_json::Value::as_str)
+                        .or_else(|| item.get("content").and_then(serde_json::Value::as_str))
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            (!text.is_empty()).then_some(text)
+        }
+        serde_json::Value::Object(object) => object
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        _ => None,
+    }
+}
+
+fn documentation_retrieval_text(path: Option<&str>, document: &str, chunk: &str) -> String {
+    let title = document
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("# ").map(str::trim))
+        .or_else(|| {
+            path.and_then(|path| Path::new(path).file_stem().and_then(|stem| stem.to_str()))
+        })
+        .unwrap_or("document");
+    let chunk_offset = document.find(chunk).unwrap_or(document.len());
+    let headings = document[..chunk_offset]
+        .lines()
+        .rev()
+        .filter_map(|line| {
+            let line = line.trim();
+            line.starts_with('#')
+                .then(|| line.trim_start_matches('#').trim())
+                .filter(|heading| !heading.is_empty())
+        })
+        .take(3)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>()
+        .join(" > ");
+    let heading_context = if headings.is_empty() {
+        String::new()
+    } else {
+        format!("\nheadings: {headings}")
+    };
+    format!(
+        "kind: documentation{}\ntitle: {title}{heading_context}\nverbatim:\n{chunk}",
+        source_context(path)
+    )
+}
+
+fn path_date(path: &str) -> Option<&str> {
+    path.split(['/', '_']).find_map(valid_date_prefix)
+}
+
+fn valid_date_prefix(value: &str) -> Option<&str> {
+    value
+        .get(..10)
+        .filter(|date| chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").is_ok())
+}
+
 fn split_identifier_words(identifier: &str) -> Vec<String> {
     let chars = identifier.chars().collect::<Vec<_>>();
     let mut words = Vec::new();
@@ -1016,6 +1204,42 @@ fn code_language(path: &Path) -> Option<&'static str> {
         ".ts" | ".tsx" => Some("typescript"),
         _ => None,
     }
+}
+
+fn content_kind_for_path(path: &Path, wing: &str, room: &str) -> ContentKind {
+    let wing = wing.to_ascii_lowercase();
+    let room = room.to_ascii_lowercase();
+    let path_text = path.to_string_lossy().to_ascii_lowercase();
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+
+    if room == "diary" || path_text.split(['/', '\\']).any(|part| part == "diary") {
+        return ContentKind::Diary;
+    }
+    if code_language(path).is_some() {
+        return ContentKind::Code;
+    }
+    if ["session", "conversation", "transcript", "chat"]
+        .iter()
+        .any(|marker| wing.contains(marker) || room.contains(marker) || path_text.contains(marker))
+    {
+        return ContentKind::Conversation;
+    }
+    let extension = normalized_extension(path).unwrap_or_default();
+    if matches!(
+        extension.as_str(),
+        ".md" | ".mdx" | ".rst" | ".adoc" | ".asciidoc"
+    ) || ["readme", "prd", "adr", "changelog"]
+        .iter()
+        .any(|prefix| file_name.starts_with(prefix))
+    {
+        return ContentKind::Documentation;
+    }
+
+    ContentKind::Prose
 }
 
 fn floor_char_boundary(content: &str, mut index: usize) -> usize {
@@ -1159,11 +1383,15 @@ mod tests {
     use async_trait::async_trait;
     use tempfile::tempdir;
 
-    use crate::{Drawer, DrawerMetadata, MemoryStore, Result, SearchHit, SearchQuery, StoreStatus};
+    use crate::{
+        ContentKind, Drawer, DrawerMetadata, MemoryStore, Result, SearchHit, SearchQuery,
+        StoreStatus,
+    };
 
     use super::{
-        MineOptions, STORE_WRITE_BATCH_SIZE, chunk_text, detect_room, flush_full_drawer_batches,
-        load_project_config, mine_project, scan_project,
+        MineOptions, RetrievalContext, STORE_WRITE_BATCH_SIZE, chunk_text, content_kind_for_path,
+        detect_room, flush_full_drawer_batches, load_project_config, mine_project,
+        retrieval_text_for_content, scan_project,
     };
 
     #[derive(Default)]
@@ -1281,6 +1509,158 @@ mod tests {
     }
 
     #[test]
+    fn content_kind_classifies_project_sources_conservatively() {
+        assert_eq!(
+            content_kind_for_path(Path::new("src/lib.rs"), "project", "src"),
+            ContentKind::Code
+        );
+        assert_eq!(
+            content_kind_for_path(Path::new("web/app.tsx"), "project", "web"),
+            ContentKind::Code
+        );
+        assert_eq!(
+            content_kind_for_path(Path::new("src/main.rs"), "chat-server", "session-runtime"),
+            ContentKind::Code
+        );
+        assert_eq!(
+            content_kind_for_path(Path::new("README.md"), "project", "general"),
+            ContentKind::Documentation
+        );
+        assert_eq!(
+            content_kind_for_path(Path::new("2026/turn.jsonl"), "codex-sessions", "2026"),
+            ContentKind::Conversation
+        );
+        assert_eq!(
+            content_kind_for_path(Path::new("2026/transcript.md"), "codex-sessions", "2026"),
+            ContentKind::Conversation
+        );
+        assert_eq!(
+            content_kind_for_path(Path::new("notes/today.txt"), "project", "notes"),
+            ContentKind::Prose
+        );
+        assert_eq!(
+            content_kind_for_path(Path::new("diary/today.txt"), "agent", "diary"),
+            ContentKind::Diary
+        );
+    }
+
+    #[test]
+    fn non_code_retrieval_adapters_add_trustworthy_context_and_keep_verbatim_text() {
+        let conversation = r#"{"role":"user","content":"I prefer compact updates."}
+{"role":"assistant","content":"I will keep them concise."}"#;
+        let conversation_text = retrieval_text_for_content(
+            ContentKind::Conversation,
+            RetrievalContext {
+                path: Some("2026/turn.jsonl"),
+                wing: "codex-sessions",
+                room: "2026",
+                agent: "codex",
+                filed_at: None,
+            },
+            conversation,
+            conversation,
+        )
+        .unwrap();
+        assert!(conversation_text.contains("user: I prefer compact updates."));
+        assert!(conversation_text.contains("assistant: I will keep them concise."));
+        assert!(conversation_text.ends_with(conversation));
+
+        let document = "# Search design\n\n## Memory budget\n\nKeep RSS below 300 MB.";
+        let documentation_text = retrieval_text_for_content(
+            ContentKind::Documentation,
+            RetrievalContext {
+                path: Some("docs/search.md"),
+                wing: "project",
+                room: "docs",
+                agent: "codex",
+                filed_at: None,
+            },
+            document,
+            "Keep RSS below 300 MB.",
+        )
+        .unwrap();
+        assert!(documentation_text.contains("title: Search design"));
+        assert!(documentation_text.contains("headings: Search design > Memory budget"));
+        assert!(documentation_text.ends_with("Keep RSS below 300 MB."));
+
+        let diary = "AAAK: search ranking improved after the model bakeoff.";
+        let diary_text = retrieval_text_for_content(
+            ContentKind::Diary,
+            RetrievalContext {
+                path: Some("diary/2026-07-15_search.md"),
+                wing: "agent",
+                room: "search-quality",
+                agent: "codex",
+                filed_at: None,
+            },
+            diary,
+            diary,
+        )
+        .unwrap();
+        assert!(diary_text.contains("date: 2026-07-15"));
+        assert!(diary_text.contains("agent: codex"));
+        assert!(diary_text.contains("topic: search-quality"));
+        assert!(diary_text.ends_with(diary));
+
+        let manual_diary = retrieval_text_for_content(
+            ContentKind::Diary,
+            RetrievalContext {
+                path: Some("diary/retrieval-quality"),
+                wing: "wing_codex",
+                room: "retrieval-quality",
+                agent: "codex",
+                filed_at: Some("2026-07-15T14:00:00+08:00"),
+            },
+            diary,
+            diary,
+        )
+        .unwrap();
+        assert!(manual_diary.contains("date: 2026-07-15"));
+        assert!(manual_diary.contains("topic: retrieval-quality"));
+
+        assert_eq!(
+            retrieval_text_for_content(
+                ContentKind::Unknown,
+                RetrievalContext {
+                    path: None,
+                    wing: "legacy",
+                    room: "general",
+                    agent: "mcp",
+                    filed_at: None,
+                },
+                "Neutral manual memory.",
+                "Neutral manual memory.",
+            )
+            .unwrap(),
+            "Neutral manual memory."
+        );
+    }
+
+    #[tokio::test]
+    async fn mine_project_enriches_markdown_session_exports_as_conversations() {
+        let tmp = tempdir().unwrap();
+        let root = tmp.path();
+        fs::write(root.join("mempalace.yml"), "wing: codex-sessions\n").unwrap();
+        fs::create_dir_all(root.join("2026")).unwrap();
+        let transcript = "user: I prefer concise progress updates.\nassistant: I will keep status messages brief and concrete.\n";
+        fs::write(root.join("2026").join("transcript.md"), transcript).unwrap();
+
+        let store = MockStore::default();
+        mine_project(&store, root, &MineOptions::default())
+            .await
+            .unwrap();
+
+        let drawers = store.list_drawers(None).await.unwrap();
+        assert_eq!(drawers.len(), 1);
+        assert_eq!(drawers[0].metadata.content_kind, ContentKind::Conversation);
+        assert_eq!(drawers[0].content, transcript.trim());
+        let retrieval_text = drawers[0].retrieval_text.as_deref().unwrap();
+        assert!(retrieval_text.contains("kind: conversation"));
+        assert!(retrieval_text.contains("session: codex-sessions/2026"));
+        assert!(retrieval_text.ends_with(transcript.trim()));
+    }
+
+    #[test]
     fn detect_room_uses_project_config_keywords() {
         let tmp = tempdir().unwrap();
         let root = tmp.path();
@@ -1316,6 +1696,11 @@ mod tests {
         fs::create_dir_all(root.join("docs")).unwrap();
         fs::write(root.join(".gitignore"), "docs/\n").unwrap();
         fs::write(root.join("src").join("main.rs"), "fn main() {}\n").unwrap();
+        fs::write(
+            root.join("multi_domain_queries.json"),
+            r#"{"benchmark_labels":["must not be mined"]}"#,
+        )
+        .unwrap();
         fs::write(
             root.join("node_modules").join("lib.js"),
             "console.log('x');\n",
@@ -1553,6 +1938,7 @@ mod tests {
                     content: "chunk".to_owned(),
                     retrieval_text: None,
                     metadata: DrawerMetadata {
+                        content_kind: ContentKind::Prose,
                         wing: "project".to_owned(),
                         room: "src".to_owned(),
                         source_file: Some(format!("drawer_{index}.txt")),

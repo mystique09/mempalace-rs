@@ -8,8 +8,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use clap::Parser;
-use mempalace_core::{Drawer, DrawerMetadata, MemoryStore, MempalaceConfig, SearchQuery};
+use clap::{Parser, ValueEnum};
+use mempalace_core::{
+    ContentKind, Drawer, DrawerMetadata, MemoryStore, MempalaceConfig, SearchQuery,
+};
 use mempalace_store::SqliteMemoryStore;
 use serde::{
     Deserialize, Serialize,
@@ -41,6 +43,33 @@ struct Args {
     /// Optional JSONL path for auditable per-question results.
     #[arg(long)]
     output: Option<PathBuf>,
+    /// Checked-in JSON file containing `dev` and `held_out` question IDs.
+    #[arg(long, requires = "subset")]
+    split_file: Option<PathBuf>,
+    /// Evaluate only one fixed split subset.
+    #[arg(long, value_enum, requires = "split_file")]
+    subset: Option<SplitSubset>,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum SplitSubset {
+    Dev,
+    HeldOut,
+}
+
+impl fmt::Display for SplitSubset {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Dev => "dev",
+            Self::HeldOut => "held-out",
+        })
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct BenchmarkSplit {
+    dev: Vec<String>,
+    held_out: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -48,6 +77,8 @@ struct BenchmarkEntry {
     question_id: String,
     question: String,
     question_type: String,
+    #[serde(default)]
+    question_date: Option<String>,
     answer_session_ids: Vec<String>,
     haystack_sessions: Vec<Vec<Turn>>,
     haystack_session_ids: Vec<String>,
@@ -92,6 +123,7 @@ fn session_drawers(entry: &BenchmarkEntry) -> Result<Vec<Drawer>, String> {
             content,
             retrieval_text: None,
             metadata: DrawerMetadata {
+                content_kind: ContentKind::Conversation,
                 wing: BENCHMARK_WING.to_owned(),
                 room: BENCHMARK_ROOM.to_owned(),
                 // Keep the benchmark label out of the production embedding
@@ -138,8 +170,7 @@ fn retrieval_metrics(
         .map(|session_id| f64::from(relevant_session_ids.contains(session_id)))
         .collect::<Vec<_>>();
     let dcg = discounted_cumulative_gain(&relevances);
-    let mut ideal = relevances;
-    ideal.sort_by(|left, right| right.total_cmp(left));
+    let ideal = vec![1.0; k.min(relevant_session_ids.len())];
     let ideal_dcg = discounted_cumulative_gain(&ideal);
     let ndcg = if ideal_dcg == 0.0 {
         0.0
@@ -176,6 +207,8 @@ struct QuestionResult {
     answer_session_ids: Vec<String>,
     ranked_session_ids: Vec<String>,
     metrics: BTreeMap<String, RetrievalMetrics>,
+    indexing_ms: u128,
+    search_ms: u128,
     elapsed_ms: u128,
 }
 
@@ -188,12 +221,16 @@ struct AggregateMetrics {
     reciprocal_rank_10: f64,
     per_type_recall_10: BTreeMap<String, (usize, f64)>,
     latency_ms: Vec<u128>,
+    search_latency_ms: Vec<u128>,
+    indexing_ms: u128,
 }
 
 impl AggregateMetrics {
     fn record(&mut self, result: &QuestionResult) {
         self.questions += 1;
         self.latency_ms.push(result.elapsed_ms);
+        self.search_latency_ms.push(result.search_ms);
+        self.indexing_ms += result.indexing_ms;
         for k in METRIC_KS {
             let metrics = result
                 .metrics
@@ -234,6 +271,20 @@ fn nearest_rank_percentile(samples: &[u128], percentile: f64) -> Option<u128> {
     Some(sorted[rank.max(1).min(sorted.len()) - 1])
 }
 
+fn wilson_interval(successes: f64, total: usize) -> (f64, f64) {
+    if total == 0 {
+        return (0.0, 0.0);
+    }
+    let z = 1.959_963_984_540_054_f64;
+    let n = total as f64;
+    let proportion = successes / n;
+    let denominator = 1.0 + z * z / n;
+    let center = (proportion + z * z / (2.0 * n)) / denominator;
+    let margin =
+        z * (proportion * (1.0 - proportion) / n + z * z / (4.0 * n * n)).sqrt() / denominator;
+    ((center - margin).max(0.0), (center + margin).min(1.0))
+}
+
 fn evaluate_question(
     runtime: &tokio::runtime::Runtime,
     store: &SqliteMemoryStore,
@@ -249,19 +300,26 @@ fn evaluate_question(
         .into());
     }
 
-    let ranked_drawer_ids = runtime.block_on(async {
+    let (ranked_drawer_ids, indexing_ms, search_ms) = runtime.block_on(async {
         store.delete_wing(BENCHMARK_WING).await?;
+        let indexing_started = Instant::now();
         store.add_drawers(drawers).await?;
+        let indexing_ms = indexing_started.elapsed().as_millis();
 
         let mut query = SearchQuery::new(&entry.question);
         query.limit = SEARCH_LIMIT;
         query.wing = Some(BENCHMARK_WING.to_owned());
+        query.as_of = entry.question_date.clone();
+        let search_started = Instant::now();
         let hits = store.search(query).await?;
-        Ok::<_, mempalace_core::MempalaceError>(
+        let search_ms = search_started.elapsed().as_millis();
+        Ok::<_, mempalace_core::MempalaceError>((
             hits.into_iter()
                 .map(|hit| hit.drawer.id)
                 .collect::<Vec<_>>(),
-        )
+            indexing_ms,
+            search_ms,
+        ))
     })?;
     let ranked_session_ids = ranked_drawer_ids
         .into_iter()
@@ -301,6 +359,8 @@ fn evaluate_question(
         answer_session_ids: entry.answer_session_ids,
         ranked_session_ids,
         metrics,
+        indexing_ms,
+        search_ms,
         elapsed_ms: started.elapsed().as_millis(),
     })
 }
@@ -382,6 +442,22 @@ fn print_summary(aggregate: &AggregateMetrics, elapsed: Duration) {
             .copied()
             .unwrap_or_default()
     );
+    println!(
+        "  Indexing:  {}ms total ({:.2}ms per question)",
+        aggregate.indexing_ms,
+        aggregate.indexing_ms as f64 / aggregate.questions as f64
+    );
+    println!(
+        "  Search:    p50={}ms p95={}ms max={}ms",
+        nearest_rank_percentile(&aggregate.search_latency_ms, 0.50).unwrap_or_default(),
+        nearest_rank_percentile(&aggregate.search_latency_ms, 0.95).unwrap_or_default(),
+        aggregate
+            .search_latency_ms
+            .iter()
+            .max()
+            .copied()
+            .unwrap_or_default()
+    );
     println!();
     for k in METRIC_KS {
         println!(
@@ -391,6 +467,11 @@ fn print_summary(aggregate: &AggregateMetrics, elapsed: Duration) {
             AggregateMetrics::mean(&aggregate.ndcg, k, aggregate.questions),
         );
     }
+    let (recall_5_low, recall_5_high) = wilson_interval(
+        aggregate.recall_any.get(&5).copied().unwrap_or_default(),
+        aggregate.questions,
+    );
+    println!("  Recall@5 95% CI: [{recall_5_low:.3}, {recall_5_high:.3}] (Wilson)");
     println!(
         "  MRR@10:   {:.3}",
         aggregate.reciprocal_rank_10 / aggregate.questions as f64
@@ -411,6 +492,19 @@ fn main() -> Result<(), Box<dyn Error>> {
     if !args.data.is_file() {
         return Err(format!("dataset does not exist: {}", args.data.display()).into());
     }
+
+    let subset = match (args.split_file.as_ref(), args.subset) {
+        (Some(path), Some(subset)) => {
+            let split: BenchmarkSplit = serde_json::from_reader(BufReader::new(File::open(path)?))?;
+            let ids = match subset {
+                SplitSubset::Dev => split.dev,
+                SplitSubset::HeldOut => split.held_out,
+            };
+            Some((subset, ids.into_iter().collect::<HashSet<_>>()))
+        }
+        (None, None) => None,
+        _ => return Err("--split-file and --subset must be provided together".into()),
+    };
 
     let config = MempalaceConfig::load()?;
     let model_dir = args.model_dir.unwrap_or_else(|| config.model_cache_path());
@@ -436,21 +530,34 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("  MemPalace-rs x LongMemEval");
     println!("============================================================");
     println!("  Data:      {}", args.data.display());
-    println!(
-        "  Questions: {}",
-        if args.limit == 0 { 500 } else { args.limit }
-    );
+    let reported_questions = subset
+        .as_ref()
+        .map(|(_, ids)| ids.len().min(limit))
+        .unwrap_or_else(|| if args.limit == 0 { 500 } else { args.limit });
+    println!("  Questions: {reported_questions}");
     println!("  Top-k:     {SEARCH_LIMIT}");
+    if let Some((subset, ids)) = &subset {
+        println!("  Split:     {subset} ({} question IDs)", ids.len());
+    }
     println!("  Palace:    isolated temporary SQLite store");
     println!();
 
     let benchmark_started = Instant::now();
     let mut aggregate = AggregateMetrics::default();
+    let mut selected = 0usize;
     let file = File::open(&args.data)?;
     let mut deserializer = serde_json::Deserializer::from_reader(BufReader::new(file));
     let processed = DatasetSeed {
-        limit,
-        visit: |entry| {
+        limit: if subset.is_some() { usize::MAX } else { limit },
+        visit: |entry: BenchmarkEntry| {
+            if subset
+                .as_ref()
+                .is_some_and(|(_, ids)| !ids.contains(&entry.question_id))
+                || selected >= limit
+            {
+                return Ok(());
+            }
+            selected += 1;
             let result =
                 evaluate_question(&runtime, &store, entry).map_err(|error| error.to_string())?;
             aggregate.record(&result);
@@ -472,8 +579,15 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     .deserialize(&mut deserializer)?;
     deserializer.end()?;
-    if processed == 0 {
+    if processed == 0 || aggregate.questions == 0 {
         return Err("dataset contained no benchmark questions".into());
+    }
+    if subset.is_some() && aggregate.questions != reported_questions {
+        return Err(format!(
+            "split expected {reported_questions} questions but matched {} dataset entries",
+            aggregate.questions
+        )
+        .into());
     }
     if let Some(writer) = output.as_mut() {
         writer.flush()?;
@@ -525,6 +639,7 @@ mod tests {
             "I graduated from MIT.\nMy degree was computer science."
         );
         assert_eq!(drawers[1].metadata.source_file, None);
+        assert_eq!(drawers[1].metadata.content_kind, ContentKind::Conversation);
         assert_eq!(drawers[1].metadata.filed_at.as_deref(), Some("2024-01-02"));
     }
 
@@ -569,6 +684,7 @@ mod tests {
         assert_eq!(at_two.recall_any, 1.0);
         assert_eq!(at_two.recall_all, 0.0);
         assert_eq!(at_two.reciprocal_rank, 0.5);
+        assert!((at_two.ndcg - 0.386_852_8).abs() < 0.000_001);
 
         let at_three = retrieval_metrics(&ranked, &relevant, 3);
         assert_eq!(at_three.recall_all, 1.0);
@@ -582,5 +698,13 @@ mod tests {
         assert_eq!(nearest_rank_percentile(&samples, 0.50), Some(30));
         assert_eq!(nearest_rank_percentile(&samples, 0.95), Some(50));
         assert_eq!(nearest_rank_percentile(&[], 0.95), None);
+    }
+
+    #[test]
+    fn reports_a_bounded_recall_confidence_interval() {
+        let (low, high) = wilson_interval(479.0, 500);
+
+        assert!((low - 0.9366).abs() < 0.001);
+        assert!((high - 0.9724).abs() < 0.001);
     }
 }
