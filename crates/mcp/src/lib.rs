@@ -172,6 +172,13 @@ impl McpServer {
     pub async fn open_with_palace(
         palace_override: Option<PathBuf>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::open_with_palace_and_model(palace_override, None).await
+    }
+
+    pub async fn open_with_palace_and_model(
+        palace_override: Option<PathBuf>,
+        model_override: Option<String>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let config = MempalaceConfig::load()?;
         config.init()?;
 
@@ -187,7 +194,8 @@ impl McpServer {
         fs::create_dir_all(&store_path)?;
         fs::create_dir_all(&model_cache_path)?;
 
-        let store = SqliteMemoryStore::new(&palace_root, &model_cache_path)?;
+        let store =
+            SqliteMemoryStore::new(&palace_root, &model_cache_path, model_override.as_deref())?;
         let graph = KnowledgeGraph::new(knowledge_graph_path)?;
 
         Ok(Self {
@@ -315,6 +323,7 @@ impl McpServer {
                     "wing": hit.drawer.metadata.wing,
                     "room": hit.drawer.metadata.room,
                     "source_file": hit.drawer.metadata.source_file.as_deref().and_then(file_name).unwrap_or("?"),
+                    "relevance": round3(hit.relevance),
                     "similarity": round3(hit.score),
                 })
             })
@@ -386,6 +395,7 @@ impl McpServer {
         let drawer = Drawer {
             id: drawer_id.clone(),
             content,
+            retrieval_text: None,
             metadata: DrawerMetadata {
                 wing: wing.clone(),
                 room: room.clone(),
@@ -539,6 +549,7 @@ impl McpServer {
         let drawer = Drawer {
             id: entry_id.clone(),
             content: entry,
+            retrieval_text: None,
             metadata: DrawerMetadata {
                 wing: wing.clone(),
                 room: "diary".to_owned(),
@@ -825,7 +836,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "Semantic search. Returns verbatim drawer content with similarity scores."
+        description = "Hybrid semantic search using dense embeddings, bounded code-domain query expansion, and indexed FTS5 ranking. Returns verbatim drawer content with fused relevance and original-query cosine similarity scores."
     )]
     async fn mempalace_search(&self, Parameters(request): Parameters<SearchRequest>) -> McpResult {
         self.tool_search(

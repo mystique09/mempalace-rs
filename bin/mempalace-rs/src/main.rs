@@ -23,6 +23,9 @@ struct Cli {
     #[arg(long, global = true)]
     palace: Option<PathBuf>,
 
+    #[arg(long, global = true)]
+    model: Option<String>,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -50,6 +53,8 @@ enum Command {
         room: Option<String>,
         #[arg(long, default_value_t = 5)]
         results: usize,
+        #[arg(long)]
+        min_score: Option<f32>,
     },
     Compress {
         #[arg(long)]
@@ -84,19 +89,9 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Backfill the vectorlite HNSW index from the drawers table.
-    /// Useful when the index gets out of sync or was created before data existed.
-    Backfill,
     DeleteWing {
         #[arg(long = "wing")]
         wing: String,
-    },
-    /// Resize the vectorlite HNSW index max_elements.
-    /// Uses vectorlite's save/load operations for O(1) reallocation.
-    Resize {
-        /// New max_elements for the HNSW index (default: 1,000,000).
-        #[arg(long, default_value_t = 1_000_000)]
-        max_elements: u64,
     },
     Migrate {
         #[arg(long = "from")]
@@ -229,6 +224,15 @@ struct AppContext {
     graph: KnowledgeGraph,
 }
 
+struct SearchOptions {
+    scope: Option<PathBuf>,
+    wing: Option<String>,
+    all_wings: bool,
+    room: Option<String>,
+    results: usize,
+    min_score: Option<f32>,
+}
+
 const INIT_ROOM_MAP: &[(&str, &str)] = &[
     ("frontend", "frontend"),
     ("front_end", "frontend"),
@@ -338,11 +342,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             no_onboarding,
             no_entity_scan,
         } => {
-            let app = open_context(cli.palace).await?;
+            let app = open_context(cli.palace, cli.model.as_deref()).await?;
             run_init(&app, dir, force, no_onboarding, no_entity_scan)?;
         }
         Command::Status => {
-            let app = open_context(cli.palace).await?;
+            let app = open_context(cli.palace, cli.model.as_deref()).await?;
             print_status(&app).await?;
         }
         Command::Search {
@@ -352,9 +356,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             all_wings,
             room,
             results,
+            min_score,
         } => {
-            let app = open_context(cli.palace).await?;
-            run_search(&app, query, scope, wing, all_wings, room, results).await?;
+            let app = open_context(cli.palace, cli.model.as_deref()).await?;
+            run_search(
+                &app,
+                query,
+                SearchOptions {
+                    scope,
+                    wing,
+                    all_wings,
+                    room,
+                    results,
+                    min_score,
+                },
+            )
+            .await?;
         }
         Command::Compress {
             wing,
@@ -362,7 +379,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             output,
             dry_run,
         } => {
-            let app = open_context(cli.palace).await?;
+            let app = open_context(cli.palace, cli.model.as_deref()).await?;
             run_compress(&app, wing, config, output, dry_run).await?;
         }
         Command::Mine {
@@ -375,7 +392,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             exclude_data_files,
             no_gitignore,
         } => {
-            let app = open_context(cli.palace).await?;
+            let app = open_context(cli.palace, cli.model.as_deref()).await?;
             run_mine(
                 &app,
                 dir,
@@ -393,28 +410,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .await?;
         }
         Command::Remine { wing, dry_run } => {
-            let app = open_context(cli.palace).await?;
+            let app = open_context(cli.palace, cli.model.as_deref()).await?;
             run_remine(&app, wing, dry_run).await?;
         }
-        Command::Backfill => {
-            let app = open_context(cli.palace).await?;
-            run_backfill(&app).await?;
-        }
         Command::DeleteWing { wing } => {
-            let app = open_context(cli.palace).await?;
+            let app = open_context(cli.palace, cli.model.as_deref()).await?;
             let count = app.store.delete_wing(&wing).await?;
             println!("Deleted {count} drawers from wing '{wing}'");
         }
-        Command::Resize { max_elements } => {
-            let app = open_context(cli.palace).await?;
-            run_resize(&app, max_elements).await?;
-        }
         Command::Migrate { from_path, dry_run } => {
-            let app = open_context(cli.palace).await?;
+            let app = open_context(cli.palace, cli.model.as_deref()).await?;
             run_migrate(&app, from_path, dry_run).await?;
         }
         Command::Tool { command } => {
-            let server = McpServer::open_with_palace(cli.palace).await?;
+            let server = McpServer::open_with_palace_and_model(cli.palace, cli.model).await?;
             run_tool_command(&server, command).await?;
         }
     }
@@ -596,6 +605,7 @@ fn extract_chroma_drawers(db_path: &PathBuf) -> Result<Vec<Drawer>, Box<dyn std:
         drawers.push(Drawer {
             id: Uuid::now_v7().to_string(),
             content: document,
+            retrieval_text: None,
             metadata: DrawerMetadata {
                 wing,
                 room,
@@ -918,6 +928,7 @@ fn looks_like_project_root(path: &Path) -> bool {
 
 async fn open_context(
     palace_override: Option<PathBuf>,
+    model_override: Option<&str>,
 ) -> Result<AppContext, Box<dyn std::error::Error>> {
     let config = MempalaceConfig::load()?;
     config.init()?;
@@ -932,7 +943,7 @@ async fn open_context(
     fs::create_dir_all(&palace_root)?;
     fs::create_dir_all(&model_cache_path)?;
 
-    let store = SqliteMemoryStore::new(&palace_root, &model_cache_path)?;
+    let store = SqliteMemoryStore::new(&palace_root, &model_cache_path, model_override)?;
     let graph = KnowledgeGraph::new(knowledge_graph_path)?;
 
     Ok(AppContext {
@@ -1902,17 +1913,19 @@ async fn print_status(app: &AppContext) -> Result<(), Box<dyn std::error::Error>
 async fn run_search(
     app: &AppContext,
     query: String,
-    scope: Option<PathBuf>,
-    wing: Option<String>,
-    all_wings: bool,
-    room: Option<String>,
-    results: usize,
+    options: SearchOptions,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let wing = resolve_search_wing(wing, all_wings, scope, env::current_dir().ok());
+    let wing = resolve_search_wing(
+        options.wing,
+        options.all_wings,
+        options.scope,
+        env::current_dir().ok(),
+    );
     let mut search = SearchQuery::new(query);
-    search.limit = results;
+    search.limit = options.results;
     search.wing = wing;
-    search.room = room;
+    search.room = options.room;
+    search.min_score = options.min_score;
 
     let hits = app.store.search(search).await?;
     if hits.is_empty() {
@@ -1928,7 +1941,10 @@ async fn run_search(
 
     for hit in hits {
         let meta = &hit.drawer.metadata;
-        println!("[{:.3}] {}/{}", hit.score, meta.wing, meta.room);
+        println!(
+            "[relevance {:.3} | similarity {:.3}] {}/{}",
+            hit.relevance, hit.score, meta.wing, meta.room
+        );
         if let Some(source_file) = &meta.source_file {
             println!("{}", source_file);
         }
@@ -2004,7 +2020,12 @@ async fn run_remine(
     println!("{:=<55}", "");
     println!("  MemPalace Remine");
     println!("{:=<55}", "");
-    println!("  Model: potion-base-32M (model2vec-rs)");
+    println!(
+        "  Embedding dim: {}",
+        app.store
+            .embedding_dim()
+            .map_or_else(|| "not loaded".to_owned(), |dim| dim.to_string())
+    );
     if dry_run {
         println!("  DRY RUN: true");
     }
@@ -2019,54 +2040,6 @@ async fn run_remine(
     println!("{:=<55}", "");
     println!("  Done.");
     println!("  Drawers re-embedded: {total}");
-    println!("{:=<55}", "");
-
-    Ok(())
-}
-
-async fn run_backfill(app: &AppContext) -> Result<(), Box<dyn std::error::Error>> {
-    println!();
-    println!("{:=<55}", "");
-    println!("  MemPalace Backfill");
-    println!("{:=<55}", "");
-    println!("  Store: {}", app.store_path.display());
-    println!("{:-<55}", "");
-
-    let status_before = app.store.status().await?;
-    println!("  Drawers total: {}", status_before.total_drawers);
-    println!();
-
-    app.store.backfill_vector_index().await?;
-
-    println!();
-    println!("{:=<55}", "");
-    println!("  Backfill complete.");
-    println!("{:=<55}", "");
-
-    Ok(())
-}
-
-async fn run_resize(app: &AppContext, max_elements: u64) -> Result<(), Box<dyn std::error::Error>> {
-    println!();
-    println!("{:=<55}", "");
-    println!("  MemPalace Resize");
-    println!("{:=<55}", "");
-    println!("  New max_elements: {max_elements}");
-    println!("  Store: {}", app.store_path.display());
-    println!("{:-<55}", "");
-
-    let status_before = app.store.status().await?;
-    println!("  Drawers before: {}", status_before.total_drawers);
-    println!();
-
-    app.store.resize_vectorlite_table(max_elements).await?;
-
-    let status_after = app.store.status().await?;
-    println!();
-    println!("{:=<55}", "");
-    println!("  Done.");
-    println!("  Drawers after: {}", status_after.total_drawers);
-    println!("  max_elements: {max_elements}");
     println!("{:=<55}", "");
 
     Ok(())

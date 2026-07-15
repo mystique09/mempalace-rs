@@ -1,5 +1,7 @@
 # PRD: Migrate mempalace-rs from LanceDB to vectorlite (SQLite-native HNSW)
 
+> **Status: superseded.** The vectorlite design was retired after production profiling found that its connection-local HNSW state could be empty, partial, or stale across MCP processes and could reserve excessive memory. The active Rust store uses bounded exact-cosine search plus independent SQLite FTS5 ranking; see `README.md` and `crates/store/src/lib.rs`.
+
 **Status:** Draft  
 **Author:** .void22  
 **Date:** 2026-04-11  

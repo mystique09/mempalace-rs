@@ -2,6 +2,7 @@ use std::{
     collections::{BTreeMap, HashSet, VecDeque},
     fs,
     io::Read,
+    ops::Range,
     path::{Component, Path, PathBuf},
 };
 
@@ -15,6 +16,7 @@ use crate::{Drawer, DrawerMetadata, MemoryStore, Result};
 const CHUNK_SIZE: usize = 800;
 const CHUNK_OVERLAP: usize = 100;
 const MIN_CHUNK_SIZE: usize = 50;
+const MAX_STRUCTURAL_CODE_UNIT_SIZE: usize = CHUNK_SIZE * 2;
 const STORE_WRITE_BATCH_SIZE: usize = 256;
 const TEXT_SNIFF_BYTES: usize = 8 * 1024;
 const MAX_BINARY_CONTROL_RATIO_PERCENT: usize = 1;
@@ -132,6 +134,19 @@ struct ProjectRoutingConfig {
     config: ProjectConfig,
 }
 
+#[derive(Debug, Clone)]
+struct MinedChunk {
+    content: String,
+    retrieval_text: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct RustCodeUnit {
+    range: Range<usize>,
+    symbol: Option<String>,
+    enclosing: Option<String>,
+}
+
 pub async fn mine_project<S: MemoryStore + ?Sized>(
     store: &S,
     project_dir: impl AsRef<Path>,
@@ -212,7 +227,7 @@ pub async fn mine_project<S: MemoryStore + ?Sized>(
         }
 
         let room = detect_room(&file, content, routing.as_ref(), &project_path);
-        let chunks = chunk_text(content);
+        let chunks = chunk_file(&file, &project_path, content);
         if chunks.is_empty() {
             summary.files_skipped += 1;
             if options.log_progress {
@@ -253,7 +268,8 @@ pub async fn mine_project<S: MemoryStore + ?Sized>(
             .enumerate()
             .map(|(chunk_index, chunk)| Drawer {
                 id: format!("drawer_{}", Uuid::now_v7().simple()),
-                content: chunk,
+                content: chunk.content,
+                retrieval_text: chunk.retrieval_text,
                 metadata: DrawerMetadata {
                     wing: wing.clone(),
                     room: room.clone(),
@@ -612,6 +628,394 @@ fn chunk_text(content: &str) -> Vec<String> {
     }
 
     chunks
+}
+
+fn chunk_file(path: &Path, project_path: &Path, content: &str) -> Vec<MinedChunk> {
+    let relative_path = path
+        .strip_prefix(project_path)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/");
+
+    if normalized_extension(path).as_deref() == Some(".rs") {
+        return chunk_rust(content, &relative_path);
+    }
+
+    if let Some(language) = code_language(path) {
+        return chunk_code_line_ranges(content)
+            .into_iter()
+            .map(|range| {
+                let code = content[range].to_owned();
+                let symbol = path.file_stem().and_then(|stem| stem.to_str());
+                MinedChunk {
+                    retrieval_text: Some(code_retrieval_text(
+                        &relative_path,
+                        language,
+                        Some("file"),
+                        symbol,
+                        &code,
+                    )),
+                    content: code,
+                }
+            })
+            .collect();
+    }
+
+    chunk_text(content)
+        .into_iter()
+        .map(|content| MinedChunk {
+            content,
+            retrieval_text: None,
+        })
+        .collect()
+}
+
+fn chunk_rust(content: &str, relative_path: &str) -> Vec<MinedChunk> {
+    let content = content.trim();
+    if content.is_empty() {
+        return Vec::new();
+    }
+
+    let parsed = parse_rust(content);
+    let structural_units = parsed
+        .as_ref()
+        .map(|tree| rust_structural_units(tree.root_node(), content))
+        .unwrap_or_default();
+
+    let mut ranges = Vec::new();
+    let mut cursor = 0usize;
+    for code_unit in &structural_units {
+        if cursor < code_unit.range.start {
+            ranges.extend(
+                chunk_code_line_ranges(&content[cursor..code_unit.range.start])
+                    .into_iter()
+                    .map(|range| (range.start + cursor)..(range.end + cursor)),
+            );
+        }
+        ranges.push(code_unit.range.clone());
+        cursor = code_unit.range.end;
+    }
+    if cursor < content.len() {
+        ranges.extend(
+            chunk_code_line_ranges(&content[cursor..])
+                .into_iter()
+                .map(|range| (range.start + cursor)..(range.end + cursor)),
+        );
+    }
+
+    ranges
+        .into_iter()
+        .map(|range| {
+            let code = content[range.clone()].to_owned();
+            let explicit_context = structural_units.iter().find(|unit| unit.range == range);
+            let inferred_context = parsed
+                .as_ref()
+                .and_then(|tree| rust_context_for_range(tree.root_node(), range.clone(), content));
+            let symbol = explicit_context
+                .and_then(|unit| unit.symbol.as_deref())
+                .or_else(|| {
+                    inferred_context
+                        .as_ref()
+                        .and_then(|context| context.0.as_deref())
+                });
+            let enclosing = explicit_context
+                .and_then(|unit| unit.enclosing.as_deref())
+                .or_else(|| {
+                    inferred_context
+                        .as_ref()
+                        .and_then(|context| context.1.as_deref())
+                });
+
+            MinedChunk {
+                retrieval_text: Some(code_retrieval_text(
+                    relative_path,
+                    "rust",
+                    enclosing,
+                    symbol,
+                    &code,
+                )),
+                content: code,
+            }
+        })
+        .collect()
+}
+
+fn parse_rust(content: &str) -> Option<tree_sitter::Tree> {
+    let mut parser = tree_sitter::Parser::new();
+    let language = tree_sitter_rust::LANGUAGE.into();
+    parser.set_language(&language).ok()?;
+    parser.parse(content, None)
+}
+
+fn rust_structural_units(root: tree_sitter::Node<'_>, content: &str) -> Vec<RustCodeUnit> {
+    let mut units = Vec::new();
+    collect_rust_structural_units(root, content, &mut units);
+    units.sort_by_key(|unit| unit.range.start);
+
+    let mut non_overlapping = Vec::new();
+    for unit in units {
+        if non_overlapping
+            .last()
+            .is_none_or(|previous: &RustCodeUnit| unit.range.start >= previous.range.end)
+        {
+            non_overlapping.push(unit);
+        }
+    }
+    non_overlapping
+}
+
+fn collect_rust_structural_units(
+    node: tree_sitter::Node<'_>,
+    content: &str,
+    units: &mut Vec<RustCodeUnit>,
+) {
+    if node.kind() == "function_item" {
+        let range = trimmed_range(content, node.byte_range());
+        let length = range
+            .as_ref()
+            .map_or(0, |range| range.end.saturating_sub(range.start));
+        if (MIN_CHUNK_SIZE..=MAX_STRUCTURAL_CODE_UNIT_SIZE).contains(&length)
+            && !rust_node_contains_kind(node, "match_arm")
+        {
+            units.push(RustCodeUnit {
+                range: range.expect("length came from this range"),
+                symbol: rust_node_symbol(node, content),
+                enclosing: rust_enclosing_symbol(node, content),
+            });
+            return;
+        }
+    }
+
+    if node.kind() == "match_arm" {
+        let Some(range) = trimmed_range(
+            content,
+            extend_rust_match_arm_range(node.byte_range(), content),
+        ) else {
+            return;
+        };
+        let length = range.end.saturating_sub(range.start);
+        if (MIN_CHUNK_SIZE..=MAX_STRUCTURAL_CODE_UNIT_SIZE).contains(&length) {
+            let symbol = node
+                .child_by_field_name("pattern")
+                .and_then(|pattern| pattern.utf8_text(content.as_bytes()).ok())
+                .and_then(rust_match_pattern_symbol);
+            units.push(RustCodeUnit {
+                range,
+                symbol,
+                enclosing: rust_enclosing_symbol(node, content),
+            });
+            return;
+        }
+    }
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_rust_structural_units(child, content, units);
+    }
+}
+
+fn rust_node_contains_kind(node: tree_sitter::Node<'_>, kind: &str) -> bool {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .any(|child| child.kind() == kind || rust_node_contains_kind(child, kind))
+}
+
+fn extend_rust_match_arm_range(mut range: Range<usize>, content: &str) -> Range<usize> {
+    let line_start = content[..range.start]
+        .rfind('\n')
+        .map_or(0, |index| index + 1);
+    if content[line_start..range.start]
+        .chars()
+        .all(char::is_whitespace)
+    {
+        range.start = line_start;
+    }
+
+    let remainder = &content[range.end..];
+    let horizontal_whitespace = remainder
+        .char_indices()
+        .take_while(|(_, ch)| matches!(ch, ' ' | '\t'))
+        .map(|(index, ch)| index + ch.len_utf8())
+        .last()
+        .unwrap_or(0);
+    let comma_index = range.end + horizontal_whitespace;
+    if content[comma_index..].starts_with(',') {
+        range.end = comma_index + 1;
+    }
+
+    range
+}
+
+fn chunk_code_line_ranges(content: &str) -> Vec<Range<usize>> {
+    let Some(content_range) = trimmed_range(content, 0..content.len()) else {
+        return Vec::new();
+    };
+
+    let mut chunks = Vec::new();
+    let mut start = content_range.start;
+    while start < content_range.end {
+        let desired_end = floor_char_boundary(content, (start + CHUNK_SIZE).min(content_range.end));
+        let end = if desired_end >= content_range.end {
+            content_range.end
+        } else if let Some(newline) = content[start..desired_end]
+            .rfind('\n')
+            .filter(|newline| *newline >= CHUNK_SIZE / 2)
+        {
+            start + newline + 1
+        } else {
+            content[desired_end..content_range.end]
+                .find('\n')
+                .map_or(content_range.end, |newline| desired_end + newline + 1)
+        };
+
+        if let Some(range) = trimmed_range(content, start..end)
+            && range.end.saturating_sub(range.start) >= MIN_CHUNK_SIZE
+        {
+            chunks.push(range);
+        }
+        start = end;
+    }
+
+    chunks
+}
+
+fn trimmed_range(content: &str, range: Range<usize>) -> Option<Range<usize>> {
+    let value = &content[range.clone()];
+    let trimmed_start = value.len() - value.trim_start().len();
+    let trimmed_end = value.trim_end().len();
+    (trimmed_start < trimmed_end)
+        .then_some((range.start + trimmed_start)..(range.start + trimmed_end))
+}
+
+fn rust_context_for_range(
+    root: tree_sitter::Node<'_>,
+    range: Range<usize>,
+    content: &str,
+) -> Option<(Option<String>, Option<String>)> {
+    let mut node = root.named_descendant_for_byte_range(range.start, range.start)?;
+    let mut symbols = Vec::new();
+    loop {
+        if let Some(symbol) = rust_node_symbol(node, content) {
+            symbols.push(symbol);
+        }
+        let Some(parent) = node.parent() else {
+            break;
+        };
+        node = parent;
+    }
+
+    let symbol = symbols.first().cloned();
+    let enclosing = symbols.get(1).cloned();
+    Some((symbol, enclosing))
+}
+
+fn rust_enclosing_symbol(node: tree_sitter::Node<'_>, content: &str) -> Option<String> {
+    let mut ancestor = node.parent();
+    while let Some(node) = ancestor {
+        if let Some(symbol) = rust_node_symbol(node, content) {
+            return Some(symbol);
+        }
+        ancestor = node.parent();
+    }
+    None
+}
+
+fn rust_node_symbol(node: tree_sitter::Node<'_>, content: &str) -> Option<String> {
+    match node.kind() {
+        "function_item" | "struct_item" | "enum_item" | "trait_item" | "mod_item" | "type_item"
+        | "const_item" | "static_item" => node
+            .child_by_field_name("name")
+            .and_then(|name| name.utf8_text(content.as_bytes()).ok())
+            .map(str::to_owned),
+        "impl_item" => node
+            .child_by_field_name("type")
+            .and_then(|name| name.utf8_text(content.as_bytes()).ok())
+            .map(str::to_owned),
+        _ => None,
+    }
+}
+
+fn rust_match_pattern_symbol(pattern: &str) -> Option<String> {
+    let pattern = pattern.trim().trim_start_matches('|').trim();
+    let symbol = pattern
+        .split(|ch: char| ch.is_whitespace() || matches!(ch, '(' | '{' | '@' | '|'))
+        .next()
+        .unwrap_or_default()
+        .trim_matches('&');
+    (!symbol.is_empty() && symbol != "_").then(|| symbol.to_owned())
+}
+
+fn code_retrieval_text(
+    path: &str,
+    language: &str,
+    enclosing: Option<&str>,
+    symbol: Option<&str>,
+    code: &str,
+) -> String {
+    let enclosing = enclosing.unwrap_or("file");
+    let symbol = symbol.unwrap_or("file");
+    let identifier_words = [symbol, enclosing]
+        .into_iter()
+        .flat_map(split_identifier_words)
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!(
+        "path: {path}\nlanguage: {language}\nenclosing: {enclosing}\nsymbol: {symbol}\nidentifier words: {identifier_words}\ncode:\n{code}"
+    )
+}
+
+fn split_identifier_words(identifier: &str) -> Vec<String> {
+    let chars = identifier.chars().collect::<Vec<_>>();
+    let mut words = Vec::new();
+    let mut current = String::new();
+
+    for (index, ch) in chars.iter().copied().enumerate() {
+        if !ch.is_alphanumeric() {
+            if !current.is_empty() {
+                words.push(current.to_lowercase());
+                current.clear();
+            }
+            continue;
+        }
+
+        let previous = index.checked_sub(1).and_then(|index| chars.get(index));
+        let next = chars.get(index + 1);
+        let starts_word = !current.is_empty()
+            && ch.is_uppercase()
+            && (previous.is_some_and(|previous| previous.is_lowercase() || previous.is_numeric())
+                || (previous.is_some_and(|previous| previous.is_uppercase())
+                    && next.is_some_and(|next| next.is_lowercase())));
+        if starts_word {
+            words.push(current.to_lowercase());
+            current.clear();
+        }
+        current.push(ch);
+    }
+
+    if !current.is_empty() {
+        words.push(current.to_lowercase());
+    }
+    words
+}
+
+fn code_language(path: &Path) -> Option<&'static str> {
+    match normalized_extension(path).as_deref()? {
+        ".c" | ".h" => Some("c"),
+        ".cc" | ".cpp" | ".cxx" | ".hpp" => Some("cpp"),
+        ".cs" => Some("csharp"),
+        ".go" => Some("go"),
+        ".java" => Some("java"),
+        ".js" | ".jsx" | ".mjs" | ".cjs" => Some("javascript"),
+        ".kt" | ".kts" => Some("kotlin"),
+        ".php" => Some("php"),
+        ".py" => Some("python"),
+        ".rb" => Some("ruby"),
+        ".rs" => Some("rust"),
+        ".sh" | ".bash" | ".zsh" => Some("shell"),
+        ".swift" => Some("swift"),
+        ".ts" | ".tsx" => Some("typescript"),
+        _ => None,
+    }
 }
 
 fn floor_char_boundary(content: &str, mut index: usize) -> usize {
@@ -976,6 +1380,117 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mine_project_keeps_rust_match_arms_as_verbatim_code_units() {
+        let tmp = tempdir().unwrap();
+        let root = tmp.path();
+        fs::write(root.join("Cargo.toml"), "[package]\nname='demo'\n").unwrap();
+        fs::create_dir_all(root.join("src")).unwrap();
+
+        let first_join_arm = r#"XtRequest::FirstJoin(_) => {
+                let first_join_request = FirstJoinRequest { socket_id: pid };
+                emulator_client.first_join(first_join_request).await?;
+            }"#;
+        let source = format!(
+            r#"async fn process_packet_cmd(xt_request: XtRequest) -> Result<(), XtRequestError> {{
+    match xt_request {{
+        XtRequest::ExecCommand(_) => {{
+{}
+        }},
+        {}
+        XtRequest::RetrieveAllUserData(_) => {{
+            emulator_client.retrieve_all_user_data(pid).await?;
+        }},
+    }}
+}}
+"#,
+            "            trace_packet_processing(pid);\n".repeat(40),
+            first_join_arm
+        );
+        let file = root.join("src").join("connection.rs");
+        fs::write(&file, &source).unwrap();
+
+        let store = MockStore::default();
+        mine_project(&store, root, &MineOptions::default())
+            .await
+            .unwrap();
+
+        let drawers = store.list_drawers(None).await.unwrap();
+        let first_join_drawer = drawers
+            .iter()
+            .find(|drawer| drawer.content.contains("XtRequest::FirstJoin"))
+            .expect("the FirstJoin match arm should be mined");
+        assert_eq!(first_join_drawer.content, first_join_arm);
+        assert!(source.contains(&first_join_drawer.content));
+    }
+
+    #[tokio::test]
+    async fn mine_project_adds_rust_symbol_context_to_embedding_text() {
+        let tmp = tempdir().unwrap();
+        let root = tmp.path();
+        fs::write(root.join("Cargo.toml"), "[package]\nname='demo'\n").unwrap();
+        fs::create_dir_all(root.join("src")).unwrap();
+        let source = r#"async fn process_packet_cmd(xt_request: XtRequest) -> Result<(), XtRequestError> {
+    match xt_request {
+        XtRequest::FirstJoin(_) => {
+            emulator_client.first_join(FirstJoinRequest { socket_id: pid }).await?;
+        }
+    }
+}"#;
+        fs::write(root.join("src").join("connection.rs"), source).unwrap();
+
+        let store = MockStore::default();
+        mine_project(&store, root, &MineOptions::default())
+            .await
+            .unwrap();
+
+        let drawers = store.list_drawers(None).await.unwrap();
+        let drawer = drawers
+            .iter()
+            .find(|drawer| drawer.content.contains("XtRequest::FirstJoin"))
+            .expect("the FirstJoin match arm should be mined");
+        let retrieval_text = drawer
+            .retrieval_text
+            .as_deref()
+            .expect("Rust chunks should carry enriched embedding text");
+        assert!(retrieval_text.contains("path: src/connection.rs"));
+        assert!(retrieval_text.contains("language: rust"));
+        assert!(retrieval_text.contains("enclosing: process_packet_cmd"));
+        assert!(retrieval_text.contains("symbol: XtRequest::FirstJoin"));
+        assert!(
+            retrieval_text.contains("identifier words: xt request first join process packet cmd")
+        );
+        assert!(retrieval_text.ends_with(&drawer.content));
+    }
+
+    #[tokio::test]
+    async fn mine_project_keeps_bounded_rust_functions_as_verbatim_code_units() {
+        let tmp = tempdir().unwrap();
+        let root = tmp.path();
+        fs::write(root.join("Cargo.toml"), "[package]\nname='demo'\n").unwrap();
+        fs::create_dir_all(root.join("src")).unwrap();
+        let source = r#"pub fn authenticate_player(username: &str, password: &str) -> bool {
+    let credentials_present = !username.is_empty() && !password.is_empty();
+    credentials_present
+}"#;
+        fs::write(root.join("src").join("auth.rs"), source).unwrap();
+
+        let store = MockStore::default();
+        mine_project(&store, root, &MineOptions::default())
+            .await
+            .unwrap();
+
+        let drawers = store.list_drawers(None).await.unwrap();
+        let function = drawers
+            .iter()
+            .find(|drawer| drawer.content.contains("fn authenticate_player"))
+            .expect("the bounded function should be mined");
+        assert_eq!(function.content, source);
+        let retrieval_text = function.retrieval_text.as_deref().unwrap();
+        assert!(retrieval_text.contains("symbol: authenticate_player"));
+        assert!(retrieval_text.contains("identifier words: authenticate player"));
+    }
+
+    #[tokio::test]
     async fn mine_project_replaces_existing_source_files_by_default() {
         let tmp = tempdir().unwrap();
         let root = tmp.path();
@@ -1036,6 +1551,7 @@ mod tests {
                 .map(|index| Drawer {
                     id: format!("drawer_{index}"),
                     content: "chunk".to_owned(),
+                    retrieval_text: None,
                     metadata: DrawerMetadata {
                         wing: "project".to_owned(),
                         room: "src".to_owned(),

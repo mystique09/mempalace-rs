@@ -15,7 +15,7 @@ The Rust code currently owns:
 
 - the `mempalace-rs` CLI
 - the `mempalace-mcp` stdio MCP server
-- the LanceDB drawer store
+- the SQLite/FTS5 drawer store
 - the AAAK compression utilities
 - the SQLite knowledge graph library
 
@@ -25,11 +25,11 @@ The Rust CLI surface is intentionally smaller than the Python package. Do not do
 
 - `bin/mempalace-rs/src/main.rs` - CLI command definitions and onboarding flow
 - `bin/mempalace-mcp/src/main.rs` - MCP binary entry point
-- `crates/core/src/config.rs` - config loading, default paths, legacy Chroma -> LanceDB handoff
+- `crates/core/src/config.rs` - config loading, default paths, and legacy Chroma handoff
 - `crates/core/src/project_miner.rs` - file scanning, chunking, room detection, and mining heuristics
 - `crates/core/src/knowledge_graph.rs` - temporal fact graph stored in SQLite
 - `crates/core/src/aaak.rs` - AAAK dialect and compression helpers
-- `crates/store/src/lib.rs` - LanceDB storage and embedding-backed search
+- `crates/store/src/lib.rs` - SQLite storage, exact-cosine/FTS5 search, and embeddings
 - `crates/mcp/src/lib.rs` - MCP tool implementations
 - `mempalace/` - reference Python implementation, examples, and upstream docs
 
@@ -62,6 +62,10 @@ For CLI changes, verify the relevant `--help` output. For mining, config, AAAK, 
 - `init` can run an interactive onboarding flow unless `--no-onboarding` is passed. That flow writes config, people maps, critical facts, and AAAK entity files under `~/.mempalace/`.
 - `mine` skips common build and cache directories, skips noisy data files by default, uses the first project path segment as the room, and deduplicates by `source_file`.
 - `search` can infer the wing from an explicit scope path or from the current working directory when it looks like a project root.
+- Search streams exact cosine comparisons through a bounded top-k heap and fuses them with an independent FTS5 ranking; do not reintroduce a process-local vector index.
+- Rust mining uses Tree-sitter structural chunks and stores enriched embedding text separately from verbatim drawer content. Other code uses line-aligned chunks; non-code keeps the text chunker.
+- The default embedding model is `minishlab/potion-code-16M-v2`. Stored model metadata must match the configured model; use a full `remine` to change it.
+- `remine` recomputes vectors for existing drawers but does not rechunk files. Delete and mine a wing again when adopting new structural chunking behavior.
 - `compress` is lossy. Keep the docs and code comments explicit about that.
 - The knowledge graph exists in Rust as a library and MCP tool set even though there are no Rust CLI subcommands for it yet.
 

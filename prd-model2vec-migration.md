@@ -1,6 +1,6 @@
 # PRD: Migrate mempalace-rs from ONNX Runtime to model2vec-rs
 
-**Status:** Draft  
+**Status:** Implemented; default model revised 2026-07-15
 **Author:** .void22  
 **Date:** 2026-04-11  
 **Target:** mempalace-rs v0.2.0
@@ -31,11 +31,11 @@ Replace the ONNX Runtime + `ort` crate stack with **model2vec-rs** — a pure-Ru
 |---|---|---|
 | Language | C/C++ with Rust FFI bindings | Pure Rust |
 | Platform deps | `onnxruntime.dll` / `.dylib` / `.so` | None — `cargo build` works everywhere |
-| Model format | ONNX `.onnx` file | Potion `.potion` static model |
-| Model size | ~80 MB (all-MiniLM-L6-v2) | 7–30 MB (potion-base-32M) |
+| Model format | ONNX `.onnx` file | Model2Vec `safetensors` static model |
+| Model size | 90.9 MB FP32 or 23 MB quantized (all-MiniLM-L6-v2) | ~32.5 MB (`potion-code-16M-v2`, F16) |
 | Inference speed | ~200 sent/sec (native) | ~340 sent/sec (1.7x faster than Python) |
 | Embedding dims | 384 (MiniLM) | Configurable: 64, 128, 256, 384, 512, 768 |
-| Quality vs MiniLM | 100% (baseline) | ~95%+ at 384-dim (MTEB avg) |
+| Retrieval quality | Contextual general-purpose baseline | Code-specific static retrieval; benchmark in the target domain |
 | Dependency footprint | ~15 MB shared lib + ort crate | Single Rust crate (~1.7 MB) |
 | Crate stability | v2.0.0-rc.11 (pre-release) | Stable on crates.io |
 
@@ -43,7 +43,7 @@ Replace the ONNX Runtime + `ort` crate stack with **model2vec-rs** — a pure-Ru
 
 - **True cross-platform**: Works on Windows, macOS (arm64 + x86_64), Linux without any native library install.
 - **Single `cargo build`**: Everything compiles from Rust source. No system package manager, no DLL hunting.
-- **Embedding quality is sufficient**: potion-base-32M at 384-dim scores ~95% of MiniLM on MTEB benchmarks. For semantic code search and conversation retrieval, this is well within acceptable range.
+- **Embedding quality matches the product workload**: `potion-code-16M-v2` is trained for natural-language-to-code retrieval. Its published CoIR average is 39.08 dense-only and 43.36 with BM25/RRF, versus 31.42 for `potion-base-32M`. The earlier claim that the general model reached ~95% of MiniLM is not supported by the published retrieval results.
 - **Faster cold start**: Model load time is near-instant (static weights, no graph compilation).
 - **Models auto-downloadable**: Can fetch from HuggingFace Hub at first run, same UX as current ONNX model download.
 - **Matches crate philosophy**: mempalace-rs already prioritizes local-first, zero-dependency operation. model2vec-rs is the same philosophy applied to embeddings.
@@ -97,12 +97,17 @@ let outputs = session.run(vec![input])?;
 let embedding: Vec<f32> = outputs[0].extract_tensor()?.into();
 ```
 
-**Proposed (model2vec-rs):**
+**Implemented (model2vec-rs):**
 ```rust
-use model2vec::InferenceModel;
+use model2vec_rs::model::StaticModel;
 
-let model = InferenceModel::load("path/to/potion-base-32M.potion")?;
-let embedding: Vec<f32> = model.embed("some text to embed")?;
+let model = StaticModel::from_pretrained(
+    "minishlab/potion-code-16M-v2",
+    None,
+    None,
+    None,
+)?;
+let embedding: Vec<f32> = model.encode_single("some text to embed");
 ```
 
 Lines of code in embedding module: ~80 → ~15.
@@ -112,14 +117,14 @@ Lines of code in embedding module: ~80 → ~15.
 **First-run flow (new users):**
 ```
 mempalace-rs mine .
-→ No model found at ~/.mempalace/potion-base-32M.potion
-→ Download from HuggingFace: minishlab/potion-base-32M (~30 MB)
+→ No cached minishlab/potion-code-16M-v2 model
+→ Download model.safetensors and tokenizer from Hugging Face (~33.5 MB total)
 → Proceed with mining
 ```
 
-**Recommended default model:** `minishlab/potion-base-32M` — 32M parameters, 384-dim embeddings, ~30 MB on disk.
+**Recommended default model:** `minishlab/potion-code-16M-v2` — 16.2M parameters, 256-dimensional embeddings, and ~32.5 MB of F16 weights on disk. `model2vec-rs` currently expands those weights to roughly 65 MB of F32 values in memory.
 
-**Optional: configurable model.** Advanced users can set `$MEMPALACE_MODEL` or a config field to use higher-quality (potion-retrieval-32M, 768-dim) or smaller (potion-base-8M, 256-dim) models.
+**Optional: configurable model.** Advanced CLI users can pass `--model <REPO_OR_PATH>`. Changing the configured model requires a full `remine` without `--wing` so stored and query embeddings remain in the same vector space.
 
 ### 4.3 Re-embedding migration
 
@@ -137,12 +142,13 @@ Implementation: iterate all drawers, read `source_file` content, run `model.embe
 
 ### 4.4 Backward-compat detection
 
-On startup, check a palace metadata field `embedding_backend: "potion-base-32M"`. If missing (old palace) or mismatched, print:
+Before embedding-backed operations, compare the configured model with the `embedding_model` value in `store_metadata`. If it is mismatched, fail with:
 ```
-⚠  Palace embeddings were generated with a different backend.
-   Run `mempalace-rs remine` to migrate.
-   Search results may be inaccurate until migration completes.
+Store embeddings use a different model.
+Reopen with the stored model or run a full `mempalace-rs --model <MODEL> remine`.
 ```
+
+Non-empty SQLite stores created before model metadata existed are labeled with the previous default, `minishlab/potion-base-32M`, so adopting the new default cannot silently misclassify their 512-dimensional vectors. A successful full remine replaces every vector and updates the metadata atomically.
 
 ---
 
@@ -161,7 +167,7 @@ On startup, check a palace metadata field `embedding_backend: "potion-base-32M"`
 
 | Risk | Likelihood | Impact | Mitigation |
 |---|---|---|---|
-| potion embedding quality lower for code search | Medium | Medium | Benchmark against MiniLM on mempalace's own search test suite before committing. If quality is poor, use potion-retrieval-32M (768-dim). |
+| Static embedding quality remains lower than a strong contextual code model | Medium | Medium | Benchmark `potion-code-16M-v2` on MemPalace queries; retain embedding-first lexical rank fusion; add an optional contextual backend only if measured quality is still insufficient. |
 | Re-embedding migration is slow for large palaces | High | Low | Show progress bar; make migration resumable; it's a one-time cost. |
 | model2vec-rs crate API changes before v1.0 | Low | Low | Pin exact version in Cargo.toml; API surface is tiny (2 functions). |
 | Users on old mempalace-rs versions can't read new drawers | Medium | Low | Embedding backend version in palace metadata. Old version shows clear error: "Palace created by newer mempalace-rs. Please upgrade." |

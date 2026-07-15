@@ -19,21 +19,30 @@ pub struct DrawerMetadata {
 pub struct Drawer {
     pub id: String,
     pub content: String,
+    /// Optional enriched representation used only for embedding and retrieval.
+    /// User-facing APIs must continue to return `content` as the verbatim source.
+    #[serde(default, skip_serializing)]
+    pub retrieval_text: Option<String>,
     pub metadata: DrawerMetadata,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SearchHit {
     pub drawer: Drawer,
+    /// Exact cosine similarity used by duplicate checks and score thresholds.
     pub score: f32,
+    /// Normalized hybrid ranking relevance used to order user-facing results.
+    #[serde(default)]
+    pub relevance: f32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SearchQuery {
     pub query: String,
     pub limit: usize,
     pub wing: Option<String>,
     pub room: Option<String>,
+    pub min_score: Option<f32>,
 }
 
 impl SearchQuery {
@@ -43,6 +52,7 @@ impl SearchQuery {
             limit: 5,
             wing: None,
             room: None,
+            min_score: None,
         }
     }
 }

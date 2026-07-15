@@ -11,9 +11,6 @@ rusqlite.workspace = true
 mempalace-core = { path = "../core" }
 workspace-hack = { version = "0.1", path = "../workspace-hack" }
 
-[build-dependencies]
-zip = "2"
-
 [dev-dependencies]
 tempfile.workspace = true
 tokio.workspace = true
