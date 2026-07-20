@@ -1479,10 +1479,12 @@ mod tests {
             .append(true)
             .open(&session_file)
             .unwrap();
-        writeln!(
-            file,
-            "{}",
-            r#"{"timestamp":"2026-07-15T01:02:00Z","type":"response_item","payload":{"type":"message","role":"assistant","phase":"final_answer","content":[{"type":"output_text","text":"Yes, from the committed cursor."}]}}"#
+        file.write_all(
+            concat!(
+                r#"{"timestamp":"2026-07-15T01:02:00Z","type":"response_item","payload":{"type":"message","role":"assistant","phase":"final_answer","content":[{"type":"output_text","text":"Yes, from the committed cursor."}]}}"#,
+                "\n"
+            )
+            .as_bytes(),
         )
         .unwrap();
         file.flush().unwrap();
@@ -1570,7 +1572,7 @@ mod tests {
             .append(true)
             .open(&session_file)
             .unwrap();
-        file.write_all(final_line[split..].as_bytes()).unwrap();
+        file.write_all(&final_line.as_bytes()[split..]).unwrap();
         file.flush().unwrap();
 
         let completed = sync_agent_sessions(&store, &config, options).await.unwrap();
